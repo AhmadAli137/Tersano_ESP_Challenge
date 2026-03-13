@@ -1,5 +1,5 @@
 .vscode/
-include/secrets.h
+main/include/secrets.h
 *.log
 sdkconfig
 sdkconfig.*
