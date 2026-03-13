@@ -5,6 +5,7 @@
 
 #include "app_config.h"
 
+// Constructor stores board mapping; hardware allocation happens in begin().
 ActuatorHal::ActuatorHal(gpio_num_t rgb_data_pin,
                          gpio_num_t piezo_pin,
                          uint8_t piezo_channel)
@@ -13,10 +14,12 @@ ActuatorHal::ActuatorHal(gpio_num_t rgb_data_pin,
       piezo_channel_(piezo_channel) {}
 
 esp_err_t ActuatorHal::begin() {
+  // Safe to call multiple times (for example after subsystem restart).
   if (initialized_) {
     return ESP_OK;
   }
 
+  // Configure single-pixel LED strip transport (RMT backend).
   led_strip_config_t strip_config = {};
   strip_config.strip_gpio_num = rgb_data_pin_;
   strip_config.max_leds = 1;
@@ -54,6 +57,7 @@ esp_err_t ActuatorHal::setRgb(uint8_t r, uint8_t g, uint8_t b) {
   if (!initialized_ || led_strip_ == nullptr) {
     return ESP_ERR_INVALID_STATE;
   }
+  // Keep RGB write atomic at HAL level: set pixel then refresh immediately.
   ESP_RETURN_ON_ERROR(led_strip_set_pixel(led_strip_, 0, r, g, b), "ActuatorHal", "RGB set pixel failed");
   return led_strip_refresh(led_strip_);
 }
@@ -68,6 +72,7 @@ esp_err_t ActuatorHal::setBuzzer(bool on, uint16_t frequency_hz) {
     return ledc_update_duty(LEDC_LOW_SPEED_MODE, static_cast<ledc_channel_t>(piezo_channel_));
   }
 
+  // ~50% duty provides audible tone while limiting drive stress.
   ESP_RETURN_ON_ERROR(ledc_set_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_1, frequency_hz), "ActuatorHal", "Piezo freq set failed");
   ESP_RETURN_ON_ERROR(ledc_set_duty(LEDC_LOW_SPEED_MODE, static_cast<ledc_channel_t>(piezo_channel_), 512), "ActuatorHal", "Piezo duty on failed");
   return ledc_update_duty(LEDC_LOW_SPEED_MODE, static_cast<ledc_channel_t>(piezo_channel_));

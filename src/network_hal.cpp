@@ -21,6 +21,7 @@ constexpr int kWifiConnectedBit = BIT0;
 EventGroupHandle_t g_wifi_event_group = nullptr;
 bool g_wifi_ready = false;
 
+// Shared event callback for Wi-Fi + IP state transitions.
 void wifiEventHandler(void*,
                       esp_event_base_t event_base,
                       int32_t event_id,
@@ -56,6 +57,7 @@ NetworkHal::NetworkHal(const char* wifi_ssid,
 
 void NetworkHal::begin() {
   if (!g_wifi_ready) {
+    // NVS is required by Wi-Fi stack; recover from partition layout/version changes.
     esp_err_t nvs_rc = nvs_flash_init();
     if (nvs_rc == ESP_ERR_NVS_NO_FREE_PAGES || nvs_rc == ESP_ERR_NVS_NEW_VERSION_FOUND) {
       nvs_flash_erase();
@@ -65,6 +67,7 @@ void NetworkHal::begin() {
     esp_event_loop_create_default();
     esp_netif_create_default_wifi_sta();
 
+    // Bring up Wi-Fi driver + event handling.
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&cfg);
     g_wifi_event_group = xEventGroupCreate();
@@ -87,6 +90,7 @@ void NetworkHal::begin() {
 void NetworkHal::loop() {
   if (!isConnected()) return;
   const uint32_t now = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
+  // Poll commands at controlled cadence to avoid excessive backend traffic.
   if (now - last_command_poll_ms_ >= appcfg::COMMAND_POLL_INTERVAL_MS) {
     last_command_poll_ms_ = now;
     pollCommand();
@@ -118,6 +122,7 @@ bool NetworkHal::httpRequest(const char* method,
                              const std::string& body,
                              int& status_code,
                              std::string* response_body) {
+  // TLS client uses ESP crt bundle to validate public server certificates.
   esp_http_client_config_t cfg = {};
   const std::string url = fullUrl(path_or_query);
   cfg.url = url.c_str();
@@ -146,6 +151,7 @@ bool NetworkHal::httpRequest(const char* method,
   status_code = esp_http_client_get_status_code(client);
   if (response_body) {
     response_body->clear();
+    // Read streaming body in chunks for variable-size JSON responses.
     char buf[256];
     int read = 0;
     do {
@@ -170,6 +176,7 @@ bool NetworkHal::pollCommand() {
   if (!httpRequest("GET", query, nullptr, "", status, &response)) return false;
   if (status < 200 || status >= 300) return false;
 
+  // Expected response: JSON array with zero or one command row.
   cJSON* root = cJSON_Parse(response.c_str());
   if (!root) return false;
   if (!cJSON_IsArray(root) || cJSON_GetArraySize(root) == 0) {

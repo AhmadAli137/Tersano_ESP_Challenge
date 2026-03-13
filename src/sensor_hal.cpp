@@ -21,6 +21,7 @@ SensorHal::SensorHal(uint8_t sda_pin, uint8_t scl_pin, uint8_t battery_adc_pin)
     : sda_pin_(sda_pin), scl_pin_(scl_pin), battery_adc_pin_(battery_adc_pin) {}
 
 void SensorHal::begin() {
+  // Configure master I2C bus shared with BME280.
   i2c_config_t cfg = {};
   cfg.mode = I2C_MODE_MASTER;
   cfg.sda_io_num = static_cast<gpio_num_t>(sda_pin_);
@@ -31,6 +32,7 @@ void SensorHal::begin() {
   i2c_param_config(kI2cPort, &cfg);
   i2c_driver_install(kI2cPort, cfg.mode, 0, 0, 0);
 
+  // Configure battery ADC channel for one-shot sampling.
   adc_oneshot_unit_init_cfg_t adc_cfg = {};
   adc_cfg.unit_id = ADC_UNIT_1;
   adc_oneshot_new_unit(&adc_cfg, &adc_handle_);
@@ -58,6 +60,7 @@ TelemetrySample SensorHal::read(uint32_t seq) {
     return sample;
   }
 
+  // Fallback waveform keeps downstream pipeline exercised without hard failure.
   fake_temp_ += 0.05f;
   if (fake_temp_ > 27.0f) fake_temp_ = 23.0f;
   fake_hum_ += 0.08f;
@@ -82,6 +85,7 @@ bool SensorHal::readRegs(uint8_t reg, uint8_t* out, size_t len) const {
 }
 
 bool SensorHal::initBme280() {
+  // Probe common BME280 addresses.
   uint8_t id = 0;
   bme_addr_ = 0x76;
   if (!readRegs(0xD0, &id, 1) || id != 0x60) {
@@ -120,6 +124,7 @@ bool SensorHal::initBme280() {
 }
 
 bool SensorHal::readBme280(float& temperature_c, float& humidity_pct, float& pressure_hpa) {
+  // Read contiguous P/T/H measurement block.
   uint8_t data[8] = {};
   if (!readRegs(0xF7, data, sizeof(data))) return false;
 
@@ -127,6 +132,7 @@ bool SensorHal::readBme280(float& temperature_c, float& humidity_pct, float& pre
   const int32_t adc_t = (static_cast<int32_t>(data[3]) << 12) | (static_cast<int32_t>(data[4]) << 4) | (data[5] >> 4);
   const int32_t adc_h = (static_cast<int32_t>(data[6]) << 8) | data[7];
 
+  // Compensation math per BME280 datasheet fixed-point formulas.
   int32_t var1 = ((((adc_t >> 3) - (static_cast<int32_t>(calib_.dig_t1) << 1))) * static_cast<int32_t>(calib_.dig_t2)) >> 11;
   int32_t var2 = (((((adc_t >> 4) - static_cast<int32_t>(calib_.dig_t1)) *
                     ((adc_t >> 4) - static_cast<int32_t>(calib_.dig_t1))) >> 12) *
@@ -164,6 +170,7 @@ bool SensorHal::readBme280(float& temperature_c, float& humidity_pct, float& pre
 float SensorHal::readBatteryVoltage() const {
   int raw = 0;
   if (adc_oneshot_read(adc_handle_, appcfg::BATTERY_ADC_CHANNEL, &raw) != ESP_OK) return NAN;
+  // Convert ADC code -> pin voltage -> pre-divider battery voltage.
   const float adc_v = (static_cast<float>(raw) / static_cast<float>(appcfg::ADC_MAX)) * appcfg::ADC_REF_VOLTAGE;
   return adc_v * appcfg::BATTERY_DIVIDER_RATIO;
 }

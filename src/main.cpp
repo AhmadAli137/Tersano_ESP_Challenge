@@ -24,12 +24,15 @@ static const char *TAG = "main";
 
 extern "C" void app_main(void)
 {
+    // Actuator subsystem owns both RGB status LED and piezo tone output.
     ActuatorHal actuator(appcfg::RGB_DATA_PIN, appcfg::PIEZO_PIN, appcfg::LEDC_CHANNEL_PIEZO);
     ESP_ERROR_CHECK(actuator.begin());
 
     bool led_on = false;
 
-    // Main heartbeat loop: toggle RGB LED and keep buzzer muted by default.
+    // Main heartbeat loop:
+    // - blink RGB pixel to indicate scheduler alive
+    // - keep buzzer off in idle state
     while (1) {
         if (led_on) {
             ESP_ERROR_CHECK(actuator.setRgb(16, 16, 16));

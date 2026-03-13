@@ -1,4 +1,5 @@
 # Managed component dependencies for the `src` component.
 # Keep versions explicit when reproducibility matters across CI/dev machines.
+# This file controls downloadable components (for example from ESP Component Registry).
 dependencies:
   espressif/led_strip: "*"
