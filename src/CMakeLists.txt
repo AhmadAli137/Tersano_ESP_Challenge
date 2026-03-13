@@ -4,6 +4,6 @@ idf_component_register(
         "led_controller.cpp"
     INCLUDE_DIRS
         "."
-        "include"
+        "../include"
     REQUIRES led_strip esp_driver_gpio
 )

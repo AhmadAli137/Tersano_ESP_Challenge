@@ -1,4 +1,4 @@
-# Managed component dependencies for the `main` component.
+# Managed component dependencies for the `src` component.
 # Keep versions explicit when reproducibility matters across CI/dev machines.
 dependencies:
   espressif/led_strip: "*"

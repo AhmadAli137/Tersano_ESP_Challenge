@@ -11,7 +11,7 @@
 #include "esp_log.h"
 #include "sdkconfig.h"
 
-#include "include/led_controller.h"
+#include "led_controller.h"
 
 // Logging tag used by ESP-IDF log output.
 static const char *TAG = "main";

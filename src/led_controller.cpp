@@ -3,7 +3,7 @@
  * Encapsulates backend-specific setup and write operations.
  */
 
-#include "include/led_controller.h"
+#include "led_controller.h"
 
 #include "driver/gpio.h"
 #include "esp_check.h"
