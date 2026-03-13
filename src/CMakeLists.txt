@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS
         "main.cpp"
-        "led_controller.cpp"
+        "actuator_hal.cpp"
         "sensor_hal.cpp"
         "network_hal.cpp"
     INCLUDE_DIRS

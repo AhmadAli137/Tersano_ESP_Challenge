@@ -3,7 +3,7 @@
  * This file intentionally stays small and focused on orchestration:
  * - initialize subsystems
  * - run the main loop/timing
- * - delegate hardware details to modules (for example, led_controller)
+ * - delegate hardware details to modules (for example, actuator_hal)
  */
 
 #include "freertos/FreeRTOS.h"
@@ -11,7 +11,8 @@
 #include "esp_log.h"
 #include "sdkconfig.h"
 
-#include "led_controller.h"
+#include "actuator_hal.h"
+#include "app_config.h"
 
 // Logging tag used by ESP-IDF log output.
 static const char *TAG = "main";
@@ -23,13 +24,21 @@ static const char *TAG = "main";
 
 extern "C" void app_main(void)
 {
-    // Initialize LED hardware/backend once at startup.
-    ESP_ERROR_CHECK(led_controller::init());
+    ActuatorHal actuator(appcfg::RGB_DATA_PIN, appcfg::PIEZO_PIN, appcfg::LEDC_CHANNEL_PIEZO);
+    ESP_ERROR_CHECK(actuator.begin());
 
-    // Main heartbeat loop: toggle LED and wait for the configured interval.
+    bool led_on = false;
+
+    // Main heartbeat loop: toggle RGB LED and keep buzzer muted by default.
     while (1) {
-        ESP_ERROR_CHECK(led_controller::toggle());
-        ESP_LOGI(TAG, "LED is now %s", led_controller::is_on() ? "ON" : "OFF");
+        if (led_on) {
+            ESP_ERROR_CHECK(actuator.setRgb(16, 16, 16));
+        } else {
+            ESP_ERROR_CHECK(actuator.setRgb(0, 0, 0));
+        }
+        ESP_ERROR_CHECK(actuator.setBuzzer(false, appcfg::PIEZO_DEFAULT_FREQ_HZ));
+        ESP_LOGI(TAG, "RGB LED is now %s", led_on ? "ON" : "OFF");
+        led_on = !led_on;
         vTaskDelay(CONFIG_BLINK_PERIOD / portTICK_PERIOD_MS);
     }
 }
