@@ -34,6 +34,9 @@ class BacklogStore {
   // Cached line count to avoid scanning on every call.
   size_t countLines() const { return line_count_; }
 
+  // Keep only the newest N lines, dropping older cached rows.
+  bool trimToNewest(size_t keep_lines);
+
  private:
   // Rewrite file from in-memory lines and refresh cached count.
   bool compactFromLines(const std::vector<std::string>& lines);

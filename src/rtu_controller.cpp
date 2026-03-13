@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstring>
 #include <cstdio>
 
 #include "cJSON.h"
@@ -23,6 +24,12 @@ constexpr uint32_t kHeartbeatIntervalMs = 60000;
 // Emit data_sync summary every 30s or after this many flushed rows.
 constexpr uint32_t kSyncSummaryIntervalMs = 30000;
 constexpr uint32_t kSyncSummaryMaxRecords = 25;
+constexpr uint32_t kTaskAliveIntervalMs = 30000;
+// Command behavior defaults.
+constexpr uint16_t kToneDefaultFreqHz = 1200;
+constexpr uint32_t kToneDefaultDurationMs = 180;
+constexpr uint32_t kLedBlinkPeriodMs = 1000;
+constexpr uint32_t kLedBlinkOnWindowMs = 500;
 
 bool readWifiLinkMeta(char* ip_out, size_t ip_out_len, int* rssi_out) {
   if (!ip_out || ip_out_len == 0 || !rssi_out) return false;
@@ -88,6 +95,18 @@ void RtuController::begin() {
   if (!backlog_.begin(appcfg::BACKLOG_FILE, appcfg::MAX_BACKLOG_LINES)) {
     ESP_LOGE(kTag, "SPIFFS/backlog init failed");
   } else {
+    if (backlog_.countLines() > appcfg::BACKLOG_STARTUP_TRIM_THRESHOLD) {
+      const size_t before = backlog_.countLines();
+      if (backlog_.trimToNewest(appcfg::BACKLOG_STARTUP_KEEP_LINES)) {
+        ESP_LOGW(kTag,
+                 "Backlog trimmed at boot: %u -> %u lines",
+                 static_cast<unsigned>(before),
+                 static_cast<unsigned>(backlog_.countLines()));
+      } else {
+        ESP_LOGW(kTag, "Backlog trim failed; continuing with %u lines",
+                 static_cast<unsigned>(backlog_.countLines()));
+      }
+    }
     ESP_LOGI(kTag, "Backlog store mounted and ready");
   }
 
@@ -122,14 +141,18 @@ void RtuController::begin() {
   TaskHandle_t sample_task = nullptr;
   TaskHandle_t publish_task = nullptr;
   TaskHandle_t conn_task = nullptr;
-  const BaseType_t sample_task_ok = xTaskCreate(sampleTaskThunk, "sampleTask", 4096, this, 5, &sample_task);
-  const BaseType_t publish_task_ok = xTaskCreate(publishTaskThunk, "publishTask", 6144, this, 5, &publish_task);
-  const BaseType_t conn_task_ok = xTaskCreate(connectivityTaskThunk, "connTask", 4096, this, 5, &conn_task);
-  if (sample_task_ok != pdPASS || publish_task_ok != pdPASS || conn_task_ok != pdPASS) {
+  TaskHandle_t cmd_task = nullptr;
+  // Keep healthy stack headroom for JSON/log/network-heavy code paths.
+  const BaseType_t sample_task_ok = xTaskCreate(sampleTaskThunk, "sampleTask", 6144, this, 5, &sample_task);
+  const BaseType_t publish_task_ok = xTaskCreate(publishTaskThunk, "publishTask", 8192, this, 5, &publish_task);
+  const BaseType_t conn_task_ok = xTaskCreate(connectivityTaskThunk, "connTask", 8192, this, 5, &conn_task);
+  const BaseType_t cmd_task_ok = xTaskCreate(commandTaskThunk, "commandTask", 6144, this, 5, &cmd_task);
+  if (sample_task_ok != pdPASS || publish_task_ok != pdPASS || conn_task_ok != pdPASS || cmd_task_ok != pdPASS) {
     ESP_LOGE(kTag, "Failed to create one or more controller tasks");
     if (sample_task) vTaskDelete(sample_task);
     if (publish_task) vTaskDelete(publish_task);
     if (conn_task) vTaskDelete(conn_task);
+    if (cmd_task) vTaskDelete(cmd_task);
     if (cfg_lock_) vSemaphoreDelete(cfg_lock_);
     if (sample_queue_) vQueueDelete(sample_queue_);
     cfg_lock_ = nullptr;
@@ -138,7 +161,7 @@ void RtuController::begin() {
   }
 
   started_ = true;
-  ESP_LOGI(kTag, "RTU controller started (sampling, publish, and connectivity tasks active)");
+  ESP_LOGI(kTag, "RTU controller started (sampling, publish, connectivity, and command tasks active)");
   publishStatusEvent("rtu_started");
 }
 
@@ -163,7 +186,12 @@ void RtuController::connectivityTaskThunk(void* ctx) {
   static_cast<RtuController*>(ctx)->connectivityTask();
 }
 
+void RtuController::commandTaskThunk(void* ctx) {
+  static_cast<RtuController*>(ctx)->commandTask();
+}
+
 void RtuController::sampleTask() {
+  uint32_t last_alive_log_ms = 0;
   while (true) {
     // Sequence increments here so every produced sample gets a unique order id.
     const TelemetrySample sample = sensor_.read(++sequence_);
@@ -171,7 +199,7 @@ void RtuController::sampleTask() {
       ESP_LOGW(kTag, "Sample queue full, dropping");
     } else {
       ESP_LOGI(kTag,
-               "S#%" PRIu32 " T=%.2fC H=%.2f%% P=%.2fhPa Vbat=%.2fV sensor_ok=%d",
+               "Sample #%" PRIu32 ": T=%.2fC H=%.2f%% P=%.2fhPa Vbat=%.2fV sensor_ok=%d",
                sample.seq,
                sample.temperature_c,
                sample.humidity_pct,
@@ -189,20 +217,53 @@ void RtuController::sampleTask() {
       interval = sample_interval_ms_;
       xSemaphoreGive(cfg_lock_);
     }
+
+    const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
+    if ((now_ms - last_alive_log_ms) >= kTaskAliveIntervalMs) {
+      ESP_LOGI(kTag,
+               "Sampler heartbeat: interval=%" PRIu32 "ms queue=%u",
+               interval,
+               static_cast<unsigned>(sample_queue_ ? uxQueueMessagesWaiting(sample_queue_) : 0));
+      last_alive_log_ms = now_ms;
+    }
     vTaskDelay(pdMS_TO_TICKS(interval));
   }
 }
 
 void RtuController::publishTask() {
+  uint32_t last_alive_log_ms = 0;
   TelemetrySample sample = {};
   while (true) {
     // Block until there is sampled data to publish.
-    if (xQueueReceive(sample_queue_, &sample, pdMS_TO_TICKS(200)) != pdTRUE) continue;
+    if (xQueueReceive(sample_queue_, &sample, pdMS_TO_TICKS(200)) != pdTRUE) {
+      const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
+      if ((now_ms - last_alive_log_ms) >= kTaskAliveIntervalMs) {
+        ESP_LOGI(kTag,
+                 "Publisher heartbeat: queue=%u backlog=%u connected=%d",
+                 static_cast<unsigned>(sample_queue_ ? uxQueueMessagesWaiting(sample_queue_) : 0),
+                 static_cast<unsigned>(backlog_.countLines()),
+                 net_.isConnected() ? 1 : 0);
+        last_alive_log_ms = now_ms;
+      }
+      continue;
+    }
     const std::string payload = sampleToJson(sample);
 
     if (net_.publishTelemetry(payload)) {
       markPublishResult(true);
-      ESP_LOGI(kTag, "Telemetry sent");
+      ESP_LOGI(kTag,
+               "Telemetry uploaded: seq=%" PRIu32 " (backlog=%u)",
+               sample.seq,
+               static_cast<unsigned>(backlog_.countLines()));
+      const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
+      if ((now_ms - last_alive_log_ms) >= kTaskAliveIntervalMs) {
+        ESP_LOGI(kTag,
+                 "Publisher heartbeat: queue=%u backlog=%u connected=%d",
+                 static_cast<unsigned>(sample_queue_ ? uxQueueMessagesWaiting(sample_queue_) : 0),
+                 static_cast<unsigned>(backlog_.countLines()),
+                 net_.isConnected() ? 1 : 0);
+        last_alive_log_ms = now_ms;
+      }
       continue;
     }
     markPublishResult(false);
@@ -212,14 +273,26 @@ void RtuController::publishTask() {
     } else {
       ESP_LOGE(kTag, "Failed to cache sample");
     }
+
+    const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
+    if ((now_ms - last_alive_log_ms) >= kTaskAliveIntervalMs) {
+      ESP_LOGI(kTag,
+               "Publisher heartbeat: queue=%u backlog=%u connected=%d",
+               static_cast<unsigned>(sample_queue_ ? uxQueueMessagesWaiting(sample_queue_) : 0),
+               static_cast<unsigned>(backlog_.countLines()),
+               net_.isConnected() ? 1 : 0);
+      last_alive_log_ms = now_ms;
+    }
   }
 }
 
 void RtuController::connectivityTask() {
+  uint32_t last_alive_log_ms = 0;
+  uint32_t last_flush_attempt_ms = 0;
+  uint32_t flush_log_batch_count = 0;
   sync_window_start_ms_ = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
   while (true) {
-    // Drive network polling state machine (commands, connectivity housekeeping).
-    net_.loop();
+    // Drive connectivity + backlog housekeeping.
     updateStatusRgb();
 
     const bool wifi_connected = net_.isConnected();
@@ -270,13 +343,29 @@ void RtuController::connectivityTask() {
     }
 
     // Drain one backlog row per iteration to avoid monopolizing network time.
-    if (wifi_connected && backlog_.countLines() > 0) {
+    const bool can_attempt_flush =
+        (now_ms - last_flush_attempt_ms) >= appcfg::BACKLOG_FLUSH_INTERVAL_MS;
+    const bool prioritize_live_telemetry =
+        sample_queue_ && uxQueueMessagesWaiting(sample_queue_) > 0;
+    if (wifi_connected && backlog_.countLines() > 0 && can_attempt_flush && !prioritize_live_telemetry) {
+      last_flush_attempt_ms = now_ms;
       std::string row;
       if (backlog_.popOldestLine(row)) {
         if (net_.publishTelemetry(row)) {
           markPublishResult(true);
           ++sync_records_in_window_;
-          ESP_LOGI(kTag, "Flushed backlog (%u left)", static_cast<unsigned>(backlog_.countLines()));
+          ++flush_log_batch_count;
+          const uint32_t remaining = static_cast<uint32_t>(backlog_.countLines());
+          if (flush_log_batch_count >= 10 || remaining <= 10) {
+            ESP_LOGI(kTag,
+                     "Backlog replay: sent %u rows, %u remaining",
+                     static_cast<unsigned>(flush_log_batch_count),
+                     static_cast<unsigned>(remaining));
+            flush_log_batch_count = 0;
+          }
+          if (remaining == 0) {
+            ESP_LOGI(kTag, "Backlog replay complete");
+          }
           const uint32_t now_sync_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
           if ((now_sync_ms - sync_window_start_ms_) >= kSyncSummaryIntervalMs ||
               sync_records_in_window_ >= kSyncSummaryMaxRecords) {
@@ -312,52 +401,160 @@ void RtuController::connectivityTask() {
       publishStatusEvent("heartbeat", hb_meta);
       last_heartbeat_ms_ = now_hb_ms;
     }
+
+    if ((now_hb_ms - last_alive_log_ms) >= kTaskAliveIntervalMs) {
+      ESP_LOGI(kTag,
+               "Connectivity heartbeat: wifi=%d cloud_degraded=%d backlog=%u",
+               net_.isConnected() ? 1 : 0,
+               isCloudDegraded(now_hb_ms) ? 1 : 0,
+               static_cast<unsigned>(backlog_.countLines()));
+      last_alive_log_ms = now_hb_ms;
+    }
     vTaskDelay(pdMS_TO_TICKS(150));
   }
 }
 
+void RtuController::commandTask() {
+  while (true) {
+    // Isolated command poll path keeps command cadence independent from backlog flushing.
+    net_.commandLoop();
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
 void RtuController::onCommand(const std::string& json) {
-  // Commands are expected as JSON object, for example:
-  // {"sampling_interval_ms":10000,"buzzer":{"on":true,"frequency_hz":1200}}
+  // Commands are expected as JSON object. Supported shapes:
+  // 1) {"type":"set_sampling_interval","sampling_interval_ms":5000}
+  // 2) {"type":"play_buzzer","frequency":1500,"duration":300}
+  // 3) {"type":"toggle_led_blink","enabled":true}
+  // Legacy compatibility:
+  // 4) {"sampling_interval_ms":10000}
+  // 5) {"buzzer":{"on":true,"frequency_hz":1200}}
   cJSON* doc = cJSON_Parse(json.c_str());
   if (!doc) {
     ESP_LOGW(kTag, "Invalid command JSON");
+    publishStatusEvent("command_failed", "{\"reason\":\"invalid_json\"}");
     return;
   }
 
-  bool changed_any = false;
+  bool ok = false;
+  std::string applied_type;
+  std::string reason = "unsupported_command";
 
-  cJSON* sampling = cJSON_GetObjectItem(doc, "sampling_interval_ms");
-  if (cJSON_IsNumber(sampling) && sampling->valueint > 0) {
-    const uint32_t bounded = static_cast<uint32_t>(
-        std::clamp(sampling->valueint,
-                   static_cast<int>(appcfg::MIN_SAMPLING_INTERVAL_MS),
-                   static_cast<int>(appcfg::MAX_SAMPLING_INTERVAL_MS)));
-    if (cfg_lock_ && xSemaphoreTake(cfg_lock_, pdMS_TO_TICKS(50)) == pdTRUE) {
-      sample_interval_ms_ = bounded;
-      xSemaphoreGive(cfg_lock_);
-    }
-    changed_any = true;
-    ESP_LOGI(kTag, "Command sampling_interval_ms=%" PRIu32, bounded);
-  }
+  cJSON* type_item = cJSON_GetObjectItem(doc, "type");
+  const char* type = (cJSON_IsString(type_item) && type_item->valuestring) ? type_item->valuestring : nullptr;
 
-  cJSON* buzzer = cJSON_GetObjectItem(doc, "buzzer");
-  if (buzzer && cJSON_IsObject(buzzer)) {
-    cJSON* on = cJSON_GetObjectItem(buzzer, "on");
-    cJSON* freq = cJSON_GetObjectItem(buzzer, "frequency_hz");
-    const bool buzzer_on = cJSON_IsBool(on) ? cJSON_IsTrue(on) : false;
-    const int f = cJSON_IsNumber(freq) ? freq->valueint : static_cast<int>(appcfg::PIEZO_DEFAULT_FREQ_HZ);
-    const uint16_t bounded_f = static_cast<uint16_t>(std::clamp(f, 200, 5000));
-    if (actuator_.setBuzzer(buzzer_on, bounded_f) != ESP_OK) {
-      ESP_LOGW(kTag, "Buzzer command failed");
+  if (type && std::strcmp(type, "set_sampling_interval") == 0) {
+    cJSON* sampling = cJSON_GetObjectItem(doc, "sampling_interval_ms");
+    if (cJSON_IsNumber(sampling) && sampling->valueint > 0) {
+      const uint32_t bounded = static_cast<uint32_t>(
+          std::clamp(sampling->valueint,
+                     static_cast<int>(appcfg::MIN_SAMPLING_INTERVAL_MS),
+                     static_cast<int>(appcfg::MAX_SAMPLING_INTERVAL_MS)));
+      if (cfg_lock_ && xSemaphoreTake(cfg_lock_, pdMS_TO_TICKS(50)) == pdTRUE) {
+        sample_interval_ms_ = bounded;
+        xSemaphoreGive(cfg_lock_);
+        ok = true;
+        applied_type = "set_sampling_interval";
+        reason = "applied";
+        ESP_LOGI(kTag, "Command sampling_interval_ms=%" PRIu32, bounded);
+      } else {
+        reason = "config_lock_timeout";
+      }
+    } else {
+      reason = "invalid_sampling_interval_ms";
     }
-    changed_any = true;
-    ESP_LOGI(kTag, "Command buzzer=%d freq=%u", buzzer_on ? 1 : 0, bounded_f);
+  } else if (type && std::strcmp(type, "play_buzzer") == 0) {
+    cJSON* freq = cJSON_GetObjectItem(doc, "frequency");
+    cJSON* duration = cJSON_GetObjectItem(doc, "duration");
+    const uint16_t tone_f = cJSON_IsNumber(freq)
+                                ? static_cast<uint16_t>(std::clamp(freq->valueint, 200, 5000))
+                                : kToneDefaultFreqHz;
+    const uint32_t tone_d = cJSON_IsNumber(duration) && duration->valueint >= 0
+                                ? static_cast<uint32_t>(std::clamp(duration->valueint, 50, 5000))
+                                : kToneDefaultDurationMs;
+    if (actuator_.playTone(tone_f, tone_d) == ESP_OK) {
+      ok = true;
+      applied_type = "play_buzzer";
+      reason = "applied";
+      ESP_LOGI(kTag, "Command play_buzzer freq=%u duration_ms=%u", tone_f, tone_d);
+    } else {
+      reason = "actuator_buzzer_failed";
+    }
+  } else if (type &&
+             (std::strcmp(type, "toggle_led_blink") == 0 ||
+              std::strcmp(type, "set_led_blink") == 0 ||
+              std::strcmp(type, "blink_led") == 0)) {
+    cJSON* enabled = cJSON_GetObjectItem(doc, "enabled");
+    if (!enabled) enabled = cJSON_GetObjectItem(doc, "on");
+    if (!enabled) enabled = cJSON_GetObjectItem(doc, "blink");
+    if (cJSON_IsBool(enabled) || cJSON_IsNumber(enabled)) {
+      const bool next = cJSON_IsBool(enabled) ? cJSON_IsTrue(enabled) : (enabled->valueint != 0);
+      led_blink_enabled_ = next;
+      ok = true;
+      applied_type = "toggle_led_blink";
+      reason = "applied";
+      ESP_LOGI(kTag, "Command toggle_led_blink enabled=%d", next ? 1 : 0);
+    } else {
+      reason = "invalid_blink_enabled";
+    }
+  } else {
+    // Legacy compatibility: direct sampling_interval_ms without "type".
+    cJSON* sampling = cJSON_GetObjectItem(doc, "sampling_interval_ms");
+    if (cJSON_IsNumber(sampling) && sampling->valueint > 0) {
+      const uint32_t bounded = static_cast<uint32_t>(
+          std::clamp(sampling->valueint,
+                     static_cast<int>(appcfg::MIN_SAMPLING_INTERVAL_MS),
+                     static_cast<int>(appcfg::MAX_SAMPLING_INTERVAL_MS)));
+      if (cfg_lock_ && xSemaphoreTake(cfg_lock_, pdMS_TO_TICKS(50)) == pdTRUE) {
+        sample_interval_ms_ = bounded;
+        xSemaphoreGive(cfg_lock_);
+        ok = true;
+        applied_type = "set_sampling_interval";
+        reason = "applied_legacy";
+        ESP_LOGI(kTag, "Legacy command sampling_interval_ms=%" PRIu32, bounded);
+      } else {
+        reason = "config_lock_timeout";
+      }
+    } else {
+      // Legacy compatibility: buzzer object.
+      cJSON* buzzer = cJSON_GetObjectItem(doc, "buzzer");
+      if (buzzer && cJSON_IsObject(buzzer)) {
+        cJSON* on = cJSON_GetObjectItem(buzzer, "on");
+        cJSON* freq = cJSON_GetObjectItem(buzzer, "frequency_hz");
+        const bool buzzer_on = cJSON_IsBool(on) ? cJSON_IsTrue(on) : false;
+        const int f = cJSON_IsNumber(freq) ? freq->valueint : static_cast<int>(appcfg::PIEZO_DEFAULT_FREQ_HZ);
+        const uint16_t bounded_f = static_cast<uint16_t>(std::clamp(f, 200, 5000));
+        if (actuator_.setBuzzer(buzzer_on, bounded_f) == ESP_OK) {
+          ok = true;
+          applied_type = "legacy_buzzer";
+          reason = "applied_legacy";
+          ESP_LOGI(kTag, "Legacy command buzzer=%d freq=%u", buzzer_on ? 1 : 0, bounded_f);
+        } else {
+          reason = "actuator_buzzer_failed";
+        }
+      }
+    }
   }
 
   cJSON_Delete(doc);
-  // Report command application result to backend for observability.
-  if (changed_any) publishStatusEvent("command_applied");
+
+  char meta[256];
+  if (ok) {
+    std::snprintf(meta,
+                  sizeof(meta),
+                  "{\"result\":\"pass\",\"type\":\"%s\"}",
+                  applied_type.empty() ? "unknown" : applied_type.c_str());
+    publishStatusEvent("command_applied", meta);
+    return;
+  }
+
+  std::snprintf(meta,
+                sizeof(meta),
+                "{\"result\":\"fail\",\"reason\":\"%s\",\"type\":\"%s\"}",
+                reason.c_str(),
+                type ? type : "unknown");
+  publishStatusEvent("command_failed", meta);
 }
 
 void RtuController::publishStatusEvent(const char* event, const std::string& metadata_json) {
@@ -406,39 +603,60 @@ std::string RtuController::statusToJson(const char* event, const std::string& me
 }
 
 void RtuController::updateStatusRgb() {
+  uint8_t r = 0;
+  uint8_t g = 0;
+  uint8_t b = 0;
+  const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
+
   // Red = station disconnected from Wi-Fi.
   if (!net_.isConnected()) {
-    if (actuator_.setRgb(255, 0, 0) != ESP_OK) {
-      ESP_LOGW(kTag, "Status RGB update failed");
-    }
-    return;
-  }
-
-  const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
-  if (isCloudDegraded(now_ms)) {
+    r = 255;
+    g = 0;
+    b = 0;
+  } else if (isCloudDegraded(now_ms)) {
     // Yellow = Wi-Fi is up but cloud publish path is failing/degraded.
-    if (actuator_.setRgb(255, 180, 0) != ESP_OK) {
-      ESP_LOGW(kTag, "Status RGB update failed");
-    }
-    return;
-  }
-
-  uint32_t interval = appcfg::DEFAULT_SAMPLING_INTERVAL_MS;
-  if (cfg_lock_ && xSemaphoreTake(cfg_lock_, pdMS_TO_TICKS(10)) == pdTRUE) {
-    interval = sample_interval_ms_;
-    xSemaphoreGive(cfg_lock_);
-  }
-
-  if (interval > appcfg::DEFAULT_SAMPLING_INTERVAL_MS) {
-    // Blue = intentionally slowed sampling interval.
-    if (actuator_.setRgb(0, 0, 255) != ESP_OK) {
-      ESP_LOGW(kTag, "Status RGB update failed");
-    }
+    r = 255;
+    g = 180;
+    b = 0;
   } else {
-    // Green = normal connected/healthy cadence.
-    if (actuator_.setRgb(0, 255, 0) != ESP_OK) {
-      ESP_LOGW(kTag, "Status RGB update failed");
+    uint32_t interval = appcfg::DEFAULT_SAMPLING_INTERVAL_MS;
+    if (cfg_lock_ && xSemaphoreTake(cfg_lock_, pdMS_TO_TICKS(10)) == pdTRUE) {
+      interval = sample_interval_ms_;
+      xSemaphoreGive(cfg_lock_);
     }
+
+    // Sampling-rate color map:
+    // - 1s  => magenta
+    // - 5s  => green (default)
+    // - 10s => blue
+    // Any other cadence falls back to green.
+    if (interval == 1000) {
+      r = 255;
+      g = 0;
+      b = 255;
+    } else if (interval == 10000) {
+      r = 0;
+      g = 0;
+      b = 255;
+    } else {
+      r = 0;
+      g = 255;
+      b = 0;
+    }
+  }
+
+  // Optional blink overlay: color is shown for half cycle, then turned off.
+  if (led_blink_enabled_) {
+    const uint32_t phase_ms = now_ms % kLedBlinkPeriodMs;
+    if (phase_ms >= kLedBlinkOnWindowMs) {
+      r = 0;
+      g = 0;
+      b = 0;
+    }
+  }
+
+  if (actuator_.setRgb(r, g, b) != ESP_OK) {
+    ESP_LOGW(kTag, "Status RGB update failed");
   }
 }
 

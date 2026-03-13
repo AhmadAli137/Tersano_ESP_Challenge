@@ -154,3 +154,25 @@ bool BacklogStore::compactFromLines(const std::vector<std::string>& lines) {
   line_count_ = lines.size();
   return true;
 }
+
+bool BacklogStore::trimToNewest(size_t keep_lines) {
+  if (line_count_ <= keep_lines) return true;
+
+  std::vector<std::string> keep;
+  keep.reserve(keep_lines);
+  FILE* f = fopen(path_.c_str(), "r");
+  if (!f) return false;
+
+  char buf[768];
+  while (fgets(buf, sizeof(buf), f) != nullptr) {
+    std::string row(buf);
+    while (!row.empty() && (row.back() == '\n' || row.back() == '\r')) row.pop_back();
+    if (row.empty()) continue;
+    keep.push_back(row);
+    if (keep.size() > keep_lines) {
+      keep.erase(keep.begin());
+    }
+  }
+  fclose(f);
+  return compactFromLines(keep);
+}

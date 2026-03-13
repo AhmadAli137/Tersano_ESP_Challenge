@@ -32,6 +32,8 @@ class ActuatorHal {
 
   // Enable/disable buzzer; when enabled, apply requested tone frequency.
   esp_err_t setBuzzer(bool on, uint16_t frequency_hz);
+  // Play a short blocking tone pulse, then stop buzzer.
+  esp_err_t playTone(uint16_t frequency_hz, uint32_t duration_ms);
 
  private:
   gpio_num_t rgb_data_pin_;

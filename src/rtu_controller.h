@@ -19,7 +19,8 @@
  * Runtime model:
  * - sampleTask: acquires periodic telemetry from SensorHal and enqueues it
  * - publishTask: publishes queue items to cloud or stores them in backlog
- * - connectivityTask: maintains network loop, flushes backlog, updates status LED
+ * - connectivityTask: flushes backlog and maintains status events / RGB state
+ * - commandTask: polls cloud commands and dispatches to onCommand()
  *
  * Design goal:
  * - keep business flow in one place while leaving hardware/protocol details in HALs
@@ -37,10 +38,12 @@ class RtuController {
   static void sampleTaskThunk(void* ctx);
   static void publishTaskThunk(void* ctx);
   static void connectivityTaskThunk(void* ctx);
+  static void commandTaskThunk(void* ctx);
   void updateStatusRgb();
   void sampleTask();
   void publishTask();
   void connectivityTask();
+  void commandTask();
   void onCommand(const std::string& json);
   // Publish a status-table event row for lifecycle/health observability.
   void publishStatusEvent(const char* event, const std::string& metadata_json = "{}");
@@ -79,4 +82,6 @@ class RtuController {
   uint32_t last_heartbeat_ms_ = 0;
   uint32_t sync_window_start_ms_ = 0;
   uint32_t sync_records_in_window_ = 0;
+  // When true, status LED color blinks on/off using the currently selected status color.
+  bool led_blink_enabled_ = false;
 };

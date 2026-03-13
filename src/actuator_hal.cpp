@@ -2,6 +2,7 @@
 
 #include "driver/ledc.h"
 #include "esp_check.h"
+#include "freertos/task.h"
 
 #include "app_config.h"
 
@@ -92,4 +93,18 @@ esp_err_t ActuatorHal::setBuzzer(bool on, uint16_t frequency_hz) {
   ESP_RETURN_ON_ERROR(ledc_set_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_1, frequency_hz), "ActuatorHal", "Piezo freq set failed");
   ESP_RETURN_ON_ERROR(ledc_set_duty(LEDC_LOW_SPEED_MODE, static_cast<ledc_channel_t>(piezo_channel_), 512), "ActuatorHal", "Piezo duty on failed");
   return ledc_update_duty(LEDC_LOW_SPEED_MODE, static_cast<ledc_channel_t>(piezo_channel_));
+}
+
+esp_err_t ActuatorHal::playTone(uint16_t frequency_hz, uint32_t duration_ms) {
+  if (!initialized_) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  // Keep tone bounded to safe/audible range and avoid long blocking pulses.
+  const uint16_t freq = static_cast<uint16_t>(frequency_hz < 200 ? 200 : (frequency_hz > 5000 ? 5000 : frequency_hz));
+  const uint32_t dur = duration_ms > 5000 ? 5000 : duration_ms;
+  ESP_RETURN_ON_ERROR(setBuzzer(true, freq), "ActuatorHal", "Tone start failed");
+  if (dur > 0) {
+    vTaskDelay(pdMS_TO_TICKS(dur));
+  }
+  return setBuzzer(false, freq);
 }

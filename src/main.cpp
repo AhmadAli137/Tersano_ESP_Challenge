@@ -33,12 +33,13 @@ static void configureOperatorLogs() {
     esp_log_level_set("ActuatorHal", ESP_LOG_INFO);
 
     // These tags are useful for debugging, but too verbose for day-to-day monitoring.
-    esp_log_level_set("wifi", ESP_LOG_WARN);
-    esp_log_level_set("wifi_init", ESP_LOG_WARN);
-    esp_log_level_set("pp", ESP_LOG_WARN);
-    esp_log_level_set("net80211", ESP_LOG_WARN);
-    esp_log_level_set("phy_init", ESP_LOG_WARN);
-    esp_log_level_set("esp-x509-crt-bundle", ESP_LOG_WARN);
+    // Keep low-level radio/PHY chatter out of normal operator logs.
+    esp_log_level_set("wifi", ESP_LOG_ERROR);
+    esp_log_level_set("wifi_init", ESP_LOG_ERROR);
+    esp_log_level_set("pp", ESP_LOG_ERROR);
+    esp_log_level_set("net80211", ESP_LOG_ERROR);
+    esp_log_level_set("phy_init", ESP_LOG_ERROR);
+    esp_log_level_set("esp-x509-crt-bundle", ESP_LOG_ERROR);
     esp_log_level_set("i2c", ESP_LOG_WARN);
 }
 

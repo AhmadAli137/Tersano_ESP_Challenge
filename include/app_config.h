@@ -50,15 +50,21 @@ static constexpr uint16_t ADC_MAX = 4095;
 static constexpr uint32_t DEFAULT_SAMPLING_INTERVAL_MS = 5000;
 static constexpr uint32_t MIN_SAMPLING_INTERVAL_MS = 1000;
 static constexpr uint32_t MAX_SAMPLING_INTERVAL_MS = 600000;
-static constexpr uint32_t COMMAND_POLL_INTERVAL_MS = 5000;
+// Base command poll cadence. NetworkHal may apply adaptive backoff when idle.
+static constexpr uint32_t COMMAND_POLL_INTERVAL_MS = 1000;
 
 // Local persistence paths/limits.
 static constexpr const char* BACKLOG_FILE = "/backlog.ndjson";
 static constexpr size_t MAX_BACKLOG_LINES = 2000;
+// If backlog grows too large, trim to most recent lines on startup.
+static constexpr size_t BACKLOG_STARTUP_TRIM_THRESHOLD = 500;
+static constexpr size_t BACKLOG_STARTUP_KEEP_LINES = 200;
+// Throttle replay so live telemetry remains responsive under heavy backlog.
+static constexpr uint32_t BACKLOG_FLUSH_INTERVAL_MS = 1200;
 
 // Backend table names.
 static constexpr const char* TABLE_TELEMETRY = "telemetry";
-static constexpr const char* TABLE_COMMANDS = "commands";
+static constexpr const char* TABLE_COMMANDS = "device_commands";
 static constexpr const char* TABLE_STATUS = "status";
 
 }  // namespace appcfg

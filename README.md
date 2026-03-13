@@ -22,13 +22,15 @@ Use this guide if you are:
 
 ## System Mental Model
 
-Think of the firmware as three loops running in parallel:
+Think of the firmware as four loops running in parallel:
 
 1. `sampleTask`: produce samples on a fixed interval.
 2. `publishTask`: send fresh sample immediately; if it fails, cache it.
-3. `connectivityTask`: maintain network/command polling and drain old cached rows.
+3. `connectivityTask`: maintain status/health state and drain old cached rows.
+4. `commandTask`: poll pending cloud commands and dispatch command handlers.
 
 This gives you both low latency (fresh sample send) and reliability (persistent backlog).
+It also isolates command polling latency/failures from backlog replay and live telemetry publishing.
 
 ## End-to-End Data Flow
 
@@ -78,8 +80,15 @@ Status LED color is controlled by RTU state:
 
 1. Red: Wi-Fi disconnected.
 2. Yellow: Wi-Fi up but cloud publish path is degraded (repeated failures/stale success window).
-3. Blue: connected and intentionally running slower-than-default sampling interval.
-4. Green: connected and healthy with normal/default cadence.
+3. Magenta: connected + cloud healthy + sampling interval set to `1000 ms` (1s).
+4. Green: connected + cloud healthy + sampling interval set to `5000 ms` (default 5s).
+5. Blue: connected + cloud healthy + sampling interval set to `10000 ms` (10s).
+
+Blink behavior:
+
+1. `toggle_led_blink` command can enable/disable LED blinking.
+2. Blinking applies to whatever status color is currently active.
+3. Blink cadence is 1 second period, 50% duty.
 
 Why you may still see mostly green:
 
@@ -122,9 +131,9 @@ Current pin/config defaults are in `include/app_config.h`:
 1. `src/main.cpp`: bootstrap, retry logic, log-level tuning.
 2. `src/rtu_controller.h/.cpp`: core orchestration, task creation, state machine.
 3. `src/sensor_hal.h/.cpp`: BME280 + battery ADC read path.
-4. `src/network_hal.h/.cpp`: Wi-Fi events + Supabase REST client.
+4. `src/network_hal.h/.cpp`: Wi-Fi events + Supabase REST transport + command polling.
 5. `src/actuator_hal.h/.cpp`: RGB + buzzer control.
-6. `src/backlog_store.h/.cpp`: SPIFFS-backed NDJSON queue.
+6. `src/backlog_store.h/.cpp`: SPIFFS-backed NDJSON queue with trim utilities.
 7. `include/app_config.h`: all tunable compile-time config.
 8. `include/secrets.example.h`: safe credential template.
 9. `partitions.csv`: app + SPIFFS partition sizing.
@@ -149,7 +158,7 @@ Set in `include/app_config.h`:
 1. `DEFAULT_SAMPLING_INTERVAL_MS = 5000` (default sample period = 5 seconds).
 2. `MIN_SAMPLING_INTERVAL_MS = 1000`.
 3. `MAX_SAMPLING_INTERVAL_MS = 600000`.
-4. `COMMAND_POLL_INTERVAL_MS = 5000`.
+4. `COMMAND_POLL_INTERVAL_MS = 1000` (base cadence; adaptive idle backoff in `NetworkHal` may increase it temporarily).
 5. `MAX_BACKLOG_LINES = 2000`.
 
 ### Supabase table names
@@ -157,7 +166,7 @@ Set in `include/app_config.h`:
 Defaults in `include/app_config.h`:
 
 1. `TABLE_TELEMETRY = "telemetry"`
-2. `TABLE_COMMANDS = "commands"`
+2. `TABLE_COMMANDS = "device_commands"`
 3. `TABLE_STATUS = "status"`
 
 These names must match your actual Supabase tables exactly.
@@ -168,9 +177,9 @@ At minimum:
 
 1. `telemetry` table: accepts JSON fields emitted by `sampleToJson`.
 2. `status` table: accepts fields from `statusToJson`.
-3. `commands` table: expected by polling path.
+3. `device_commands` table: expected by polling path.
 
-`commands` should include at least:
+`device_commands` should include at least:
 
 1. `id` (monotonic key used for ordering/patch).
 2. `device_id` (text).
@@ -183,7 +192,24 @@ Firmware command poll query expects:
 2. `processed = eq.false`
 3. `order = id.asc`
 4. `limit = 1`
-5. `select = id,command`
+5. `select = *` (firmware accepts `command` or fallback `payload` JSON fields)
+
+Supported command payloads (in `device_commands.command` JSON):
+
+1. `{"type":"set_sampling_interval","sampling_interval_ms":5000}`
+2. `{"type":"play_buzzer","frequency":1500,"duration":300}`
+3. `{"type":"toggle_led_blink","enabled":true}`
+
+Notes:
+
+1. `set_sampling_interval` drives the status LED color map for healthy/connected state.
+2. `play_buzzer` is a momentary tone pulse and then returns to off.
+3. `toggle_led_blink` accepts `enabled` (also `on`/`blink` aliases for compatibility).
+
+Command outcome events written to `status`:
+
+1. `command_applied` with metadata `{ "result":"pass", "type":"..." }`
+2. `command_failed` with metadata `{ "result":"fail", "reason":"...", "type":"..." }`
 
 ### Status table migration (recommended)
 
@@ -230,13 +256,13 @@ This is why your large binary builds while still keeping local backlog storage.
 1. Bootloader loads app.
 2. `main.cpp` starts RTU bootstrap with retry.
 3. RTU initializes actuator, sensor, network, backlog.
-4. RTU spawns `sampleTask`, `publishTask`, `connectivityTask`.
+4. RTU spawns `sampleTask`, `publishTask`, `connectivityTask`, and `commandTask`.
 5. System enters steady-state loop.
 
 Healthy startup markers:
 
 1. `NetworkHal: Wi-Fi connected. IP address acquired: ...`
-2. `RTU controller started (sampling, publish, and connectivity tasks active)`
+2. `RTU controller started (sampling, publish, connectivity, and command tasks active)`
 3. repeating `Telemetry sent` and/or `Flushed backlog (...)`
 
 ## Troubleshooting Guide

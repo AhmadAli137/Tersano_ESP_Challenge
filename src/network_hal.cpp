@@ -12,6 +12,7 @@
 #include "esp_wifi.h"
 #include "esp_crt_bundle.h"
 #include "freertos/event_groups.h"
+#include "freertos/task.h"
 #include "nvs_flash.h"
 
 #include "app_config.h"
@@ -20,13 +21,30 @@ namespace {
 constexpr const char* kTag = "NetworkHal";
 constexpr int kWifiConnectedBit = BIT0;
 constexpr size_t kStatusPayloadLogLimit = 240;
+constexpr size_t kHttpResponseCaptureLimit = 2048;
+constexpr uint32_t kNoCommandLogIntervalMs = 60000;
+constexpr uint32_t kCommandAckRetryCount = 3;
+constexpr uint32_t kCommandAckRetryBaseMs = 250;
+constexpr uint32_t kCommandPollBackoffStepMs = 500;
+constexpr uint32_t kCommandPollBackoffMaxMs = 5000;
 // Process-wide Wi-Fi event group used by isConnected() and event callbacks.
 EventGroupHandle_t g_wifi_event_group = nullptr;
 bool g_wifi_ready = false;
+uint32_t g_last_no_command_log_ms = 0;
 
-std::string logPreview(const std::string& text, size_t max_len = kStatusPayloadLogLimit) {
-  if (text.size() <= max_len) return text;
-  return text.substr(0, max_len) + "...<truncated>";
+esp_err_t httpEventHandler(esp_http_client_event_t* evt) {
+  if (!evt) return ESP_OK;
+  if (evt->event_id == HTTP_EVENT_ON_DATA && evt->user_data && evt->data && evt->data_len > 0) {
+    auto* out = static_cast<std::string*>(evt->user_data);
+    const size_t incoming = static_cast<size_t>(evt->data_len);
+    if (out->size() >= kHttpResponseCaptureLimit) return ESP_OK;
+    const size_t room = kHttpResponseCaptureLimit - out->size();
+    const size_t take = incoming < room ? incoming : room;
+    if (take > 0) {
+      out->append(static_cast<const char*>(evt->data), take);
+    }
+  }
+  return ESP_OK;
 }
 
 // Shared event callback for Wi-Fi + IP state transitions.
@@ -109,6 +127,7 @@ void NetworkHal::begin() {
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
     esp_wifi_start();
+    ESP_LOGI(kTag, "Command table configured as: %s", commands_table_);
     http_lock_ = xSemaphoreCreateMutex();
     if (!http_lock_) {
       ESP_LOGE(kTag, "Failed to create HTTP mutex");
@@ -119,12 +138,33 @@ void NetworkHal::begin() {
 }
 
 void NetworkHal::loop() {
+  commandLoop();
+}
+
+void NetworkHal::commandLoop() {
   if (!isConnected()) return;
   const uint32_t now = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
   // Poll commands at controlled cadence to avoid excessive backend traffic.
-  if (now - last_command_poll_ms_ >= appcfg::COMMAND_POLL_INTERVAL_MS) {
+  if (now - last_command_poll_ms_ >= command_poll_interval_ms_) {
     last_command_poll_ms_ = now;
-    pollCommand();
+    bool had_pending_command = false;
+    const bool ok = pollCommand(&had_pending_command);
+    if (!ok) {
+      // Keep responsive retries on transport/HTTP failures.
+      command_poll_interval_ms_ = appcfg::COMMAND_POLL_INTERVAL_MS;
+      return;
+    }
+    if (had_pending_command) {
+      // A command is flowing: stay at base interval for low-latency follow-up commands.
+      command_poll_interval_ms_ = appcfg::COMMAND_POLL_INTERVAL_MS;
+      return;
+    }
+    // No pending rows: gradually back off to reduce load while idle.
+    if (command_poll_interval_ms_ < kCommandPollBackoffMaxMs) {
+      const uint32_t next = command_poll_interval_ms_ + kCommandPollBackoffStepMs;
+      command_poll_interval_ms_ =
+          next > kCommandPollBackoffMaxMs ? kCommandPollBackoffMaxMs : next;
+    }
   }
 }
 
@@ -157,16 +197,26 @@ bool NetworkHal::publishStatus(const std::string& payload) {
     return false;
   }
   if (!httpRequest("POST", buildRestPath(status_table_), "application/json", payload, status, nullptr)) {
+    const int preview_len = static_cast<int>(
+        payload.size() < kStatusPayloadLogLimit ? payload.size() : kStatusPayloadLogLimit);
     ESP_LOGW(kTag,
-             "Status publish failed: transport/TLS error payload=%s",
-             logPreview(payload).c_str());
+             "Status publish failed: transport/TLS error payload(%uB)=%.*s%s",
+             static_cast<unsigned>(payload.size()),
+             preview_len,
+             payload.c_str(),
+             payload.size() > kStatusPayloadLogLimit ? "...<truncated>" : "");
     return false;
   }
   if (status < 200 || status >= 300) {
+    const int preview_len = static_cast<int>(
+        payload.size() < kStatusPayloadLogLimit ? payload.size() : kStatusPayloadLogLimit);
     ESP_LOGW(kTag,
-             "Status publish failed: HTTP status=%d payload=%s",
+             "Status publish failed: HTTP status=%d payload(%uB)=%.*s%s",
              status,
-             logPreview(payload).c_str());
+             static_cast<unsigned>(payload.size()),
+             preview_len,
+             payload.c_str(),
+             payload.size() > kStatusPayloadLogLimit ? "...<truncated>" : "");
     return false;
   }
   return true;
@@ -192,6 +242,11 @@ bool NetworkHal::httpRequest(const char* method,
   // NOTE: In current architecture this function can be called from multiple tasks.
   // Per-call client handles keep this path re-entrant and avoid shared-state races.
   // We still enable TCP keep-alive so underlying transport can reuse sockets when possible.
+  std::string local_body;
+  std::string* body_out = response_body ? response_body : &local_body;
+  body_out->clear();
+  body_out->reserve(512);
+
   esp_http_client_config_t cfg = {};
   const std::string url = fullUrl(path_or_query);
   cfg.url = url.c_str();
@@ -208,6 +263,8 @@ bool NetworkHal::httpRequest(const char* method,
   cfg.auth_type = HTTP_AUTH_TYPE_NONE;
   cfg.transport_type = HTTP_TRANSPORT_OVER_SSL;
   cfg.crt_bundle_attach = esp_crt_bundle_attach;
+  cfg.user_data = body_out;
+  cfg.event_handler = httpEventHandler;
 
   esp_http_client_handle_t client = esp_http_client_init(&cfg);
   if (!client) {
@@ -244,18 +301,6 @@ bool NetworkHal::httpRequest(const char* method,
   }
 
   status_code = esp_http_client_get_status_code(client);
-  std::string local_body;
-  std::string* body_out = response_body ? response_body : &local_body;
-  body_out->clear();
-
-  // Read streaming body in chunks for variable-size JSON responses.
-  char buf[256];
-  int read = 0;
-  do {
-    read = esp_http_client_read(client, buf, sizeof(buf));
-    if (read > 0) body_out->append(buf, read);
-  } while (read > 0);
-
   if (status_code >= 400) {
     const char* resp_text = body_out->empty() ? "<empty>" : body_out->c_str();
     ESP_LOGW(kTag, "HTTP %s %s returned status=%d body=%s",
@@ -267,14 +312,15 @@ bool NetworkHal::httpRequest(const char* method,
   return true;
 }
 
-bool NetworkHal::pollCommand() {
+bool NetworkHal::pollCommand(bool* had_pending_command) {
+  if (had_pending_command) *had_pending_command = false;
   if (!command_handler_) return false;
 
   int status = 0;
   std::string response;
   const std::string query = buildRestPath(commands_table_) +
                             "?device_id=eq." + device_id_ +
-                            "&processed=eq.false&order=id.asc&limit=1&select=id,command";
+                            "&processed=eq.false&order=id.asc&limit=1&select=*";
 
   if (!httpRequest("GET", query, nullptr, "", status, &response)) {
     ESP_LOGW(kTag, "Command poll failed: transport/TLS error");
@@ -284,11 +330,18 @@ bool NetworkHal::pollCommand() {
     ESP_LOGW(kTag, "Command poll failed: HTTP status=%d", status);
     return false;
   }
+  ESP_LOGD(kTag, "Command poll HTTP %d, response bytes=%u",
+           status, static_cast<unsigned>(response.size()));
 
   // Expected response: JSON array with zero or one command row.
   // Empty body is interpreted as "no command available".
   if (response.empty()) {
     // Some backends/proxies may return 204/empty for "no rows"; treat as no command.
+    const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
+    if ((now_ms - g_last_no_command_log_ms) >= kNoCommandLogIntervalMs) {
+      ESP_LOGI(kTag, "Command poll active: no pending command rows (empty response)");
+      g_last_no_command_log_ms = now_ms;
+    }
     return true;
   }
   cJSON* root = cJSON_Parse(response.c_str());
@@ -299,15 +352,25 @@ bool NetworkHal::pollCommand() {
   }
   if (!cJSON_IsArray(root) || cJSON_GetArraySize(root) == 0) {
     cJSON_Delete(root);
+    const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
+    if ((now_ms - g_last_no_command_log_ms) >= kNoCommandLogIntervalMs) {
+      ESP_LOGI(kTag, "Command poll active: no pending command rows");
+      g_last_no_command_log_ms = now_ms;
+    }
     return true;
   }
 
   cJSON* row = cJSON_GetArrayItem(root, 0);
+  if (had_pending_command) *had_pending_command = true;
   cJSON* id = cJSON_GetObjectItem(row, "id");
   cJSON* cmd = cJSON_GetObjectItem(row, "command");
-  if (!cJSON_IsNumber(id) || !cmd) {
+  if (!cmd) {
+    // Compatibility path: some schemas use "payload" instead of "command".
+    cmd = cJSON_GetObjectItem(row, "payload");
+  }
+  if (!id || !cmd) {
     cJSON_Delete(root);
-    ESP_LOGW(kTag, "Command poll failed: malformed command row");
+    ESP_LOGW(kTag, "Command poll failed: malformed command row (expected id + command/payload)");
     return false;
   }
 
@@ -317,27 +380,65 @@ bool NetworkHal::pollCommand() {
     ESP_LOGW(kTag, "Command poll failed: JSON serialization error");
     return false;
   }
-  command_handler_(std::string(cmd_text));
+  std::string cmd_id;
+  if (cJSON_IsString(id) && id->valuestring) {
+    cmd_id = id->valuestring;
+  } else if (cJSON_IsNumber(id)) {
+    // Backward compatibility with integer id schemas.
+    char id_buf[32];
+    std::snprintf(id_buf, sizeof(id_buf), "%.0f", id->valuedouble);
+    cmd_id = id_buf;
+  } else {
+    cJSON_Delete(root);
+    ESP_LOGW(kTag, "Command poll failed: unsupported id type");
+    return false;
+  }
+
+  const std::string cmd_payload(cmd_text);
   cJSON_free(cmd_text);
-  const uint64_t cmd_id = static_cast<uint64_t>(id->valuedouble);
+  const int cmd_preview_len = static_cast<int>(
+      cmd_payload.size() < kStatusPayloadLogLimit ? cmd_payload.size() : kStatusPayloadLogLimit);
+  ESP_LOGI(kTag,
+           "Command received id=%s payload(%uB)=%.*s%s",
+           cmd_id.c_str(),
+           static_cast<unsigned>(cmd_payload.size()),
+           cmd_preview_len,
+           cmd_payload.c_str(),
+           cmd_payload.size() > kStatusPayloadLogLimit ? "...<truncated>" : "");
+  command_handler_(cmd_payload);
   cJSON_Delete(root);
-  return markCommandProcessed(cmd_id);
+  const bool marked = markCommandProcessed(cmd_id);
+  if (marked) {
+    ESP_LOGI(kTag, "Command processed id=%s", cmd_id.c_str());
+  } else {
+    ESP_LOGW(kTag, "Command process ACK failed id=%s", cmd_id.c_str());
+  }
+  return marked;
 }
 
-bool NetworkHal::markCommandProcessed(uint64_t command_id) {
-  int status = 0;
-  const std::string query = buildRestPath(commands_table_) + "?id=eq." + std::to_string(command_id);
-  if (!httpRequest("PATCH", query, "application/json", "{\"processed\":true}", status, nullptr)) {
-    ESP_LOGW(kTag, "Mark command processed failed for id=%llu: transport/TLS error",
-             static_cast<unsigned long long>(command_id));
+bool NetworkHal::markCommandProcessed(const std::string& command_id) {
+  if (command_id.empty()) {
+    ESP_LOGW(kTag, "Mark command processed failed: empty id");
     return false;
   }
-  if (status < 200 || status >= 300) {
-    ESP_LOGW(kTag, "Mark command processed failed for id=%llu: HTTP status=%d",
-             static_cast<unsigned long long>(command_id), status);
-    return false;
+  const std::string query = buildRestPath(commands_table_) + "?id=eq." + command_id;
+  for (uint32_t attempt = 1; attempt <= kCommandAckRetryCount; ++attempt) {
+    int status = 0;
+    if (httpRequest("PATCH", query, "application/json", "{\"processed\":true}", status, nullptr) &&
+        status >= 200 && status < 300) {
+      return true;
+    }
+
+    ESP_LOGW(kTag,
+             "Mark command processed retry %u/%u failed for id=%s",
+             static_cast<unsigned>(attempt),
+             static_cast<unsigned>(kCommandAckRetryCount),
+             command_id.c_str());
+    if (attempt < kCommandAckRetryCount) {
+      vTaskDelay(pdMS_TO_TICKS(kCommandAckRetryBaseMs * attempt));
+    }
   }
-  return true;
+  return false;
 }
 
 std::string NetworkHal::buildRestPath(const char* table) const {
