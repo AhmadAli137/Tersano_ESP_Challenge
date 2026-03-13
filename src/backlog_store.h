@@ -11,6 +11,11 @@
  * - survive temporary network outages by buffering outbound payloads
  * - cap storage growth with a maximum line count
  * - keep API simple for append/requeue/dequeue workflow
+ *
+ * Queue behavior:
+ * - appendLine() adds newest data to tail
+ * - popOldestLine() returns head for FIFO replay
+ * - prependLine() pushes a failed replay row back to head
  */
 class BacklogStore {
  public:

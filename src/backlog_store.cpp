@@ -5,6 +5,13 @@
 #include "esp_log.h"
 #include "esp_spiffs.h"
 
+/*
+ * Backlog storage strategy:
+ * - persist one JSON object per line
+ * - keep operations simple and deterministic on embedded flash
+ * - trade write efficiency for implementation clarity/reliability
+ */
+
 namespace {
 constexpr const char* kTag = "BacklogStore";
 constexpr const char* kBasePath = "/spiffs";
@@ -20,6 +27,8 @@ std::string makeFsPath(const std::string& logical) {
 bool BacklogStore::begin(const char* path, size_t max_lines) {
   path_ = makeFsPath(path ? path : "/backlog.ndjson");
   max_lines_ = max_lines;
+  ESP_LOGI(kTag, "Mounting SPIFFS backlog store at %s (max lines: %u)",
+           path_.c_str(), static_cast<unsigned>(max_lines_));
 
   // Mount SPIFFS once for this process. format_if_mount_failed=true prioritizes resilience.
   esp_vfs_spiffs_conf_t conf = {};
@@ -27,17 +36,26 @@ bool BacklogStore::begin(const char* path, size_t max_lines) {
   conf.partition_label = nullptr;
   conf.max_files = 8;
   conf.format_if_mount_failed = true;
-  if (esp_vfs_spiffs_register(&conf) != ESP_OK) return false;
+  if (esp_vfs_spiffs_register(&conf) != ESP_OK) {
+    ESP_LOGE(kTag, "SPIFFS mount failed");
+    return false;
+  }
 
   // Ensure file exists so later read/write calls have a valid target.
   FILE* f = fopen(path_.c_str(), "a+");
-  if (!f) return false;
+  if (!f) {
+    ESP_LOGE(kTag, "Failed to create/open backlog file: %s", path_.c_str());
+    return false;
+  }
   fclose(f);
 
   // Build initial cached count from current file content.
   line_count_ = 0;
   f = fopen(path_.c_str(), "r");
-  if (!f) return false;
+  if (!f) {
+    ESP_LOGE(kTag, "Failed to read backlog file: %s", path_.c_str());
+    return false;
+  }
   char buf[512];
   while (fgets(buf, sizeof(buf), f) != nullptr) {
     if (buf[0] != '\n' && buf[0] != '\0') ++line_count_;
@@ -48,6 +66,7 @@ bool BacklogStore::begin(const char* path, size_t max_lines) {
 }
 
 bool BacklogStore::appendLine(const std::string& line) {
+  // Fast path: append row to tail.
   FILE* f = fopen(path_.c_str(), "a");
   if (!f) return false;
   const int rc = fprintf(f, "%s\n", line.c_str());

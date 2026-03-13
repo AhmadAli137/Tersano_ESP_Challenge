@@ -4,6 +4,19 @@
 #include <functional>
 #include <string>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
+/*
+ * NetworkHal wraps all cloud/network interactions:
+ * - Wi-Fi STA bring-up and reconnect handling
+ * - HTTPS REST calls to Supabase tables
+ * - command polling and callback dispatch
+ *
+ * Threading note:
+ * - publish/loop methods may be called from different controller tasks.
+ * - request helper is written to avoid shared mutable client state.
+ */
 /*
  * NetworkHal owns connectivity + cloud transport:
  * - Wi-Fi station lifecycle
@@ -66,4 +79,6 @@ class NetworkHal {
   CommandHandler command_handler_;
   // Last command-poll timestamp in milliseconds since boot.
   uint32_t last_command_poll_ms_ = 0;
+  // Guards esp_http_client usage so publish/poll/flush do not run concurrent HTTP operations.
+  SemaphoreHandle_t http_lock_ = nullptr;
 };

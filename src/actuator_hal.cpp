@@ -5,6 +5,17 @@
 
 #include "app_config.h"
 
+/*
+ * Actuator HAL implementation details:
+ * - RGB uses RMT-backed led_strip driver (single pixel)
+ * - piezo uses LEDC low-speed PWM channel
+ * - RGB logical colors are remapped by appcfg RGB_ORDER_* constants
+ */
+
+static_assert(appcfg::RGB_ORDER_R_INDEX < 3, "RGB_ORDER_R_INDEX must be 0..2");
+static_assert(appcfg::RGB_ORDER_G_INDEX < 3, "RGB_ORDER_G_INDEX must be 0..2");
+static_assert(appcfg::RGB_ORDER_B_INDEX < 3, "RGB_ORDER_B_INDEX must be 0..2");
+
 // Constructor stores board mapping; hardware allocation happens in begin().
 ActuatorHal::ActuatorHal(gpio_num_t rgb_data_pin,
                          gpio_num_t piezo_pin,
@@ -57,8 +68,13 @@ esp_err_t ActuatorHal::setRgb(uint8_t r, uint8_t g, uint8_t b) {
   if (!initialized_ || led_strip_ == nullptr) {
     return ESP_ERR_INVALID_STATE;
   }
+  // Remap logical RGB order to physical LED channel order for board compatibility.
+  const uint8_t input[3] = {r, g, b};
+  const uint8_t phys_r = input[appcfg::RGB_ORDER_R_INDEX];
+  const uint8_t phys_g = input[appcfg::RGB_ORDER_G_INDEX];
+  const uint8_t phys_b = input[appcfg::RGB_ORDER_B_INDEX];
   // Keep RGB write atomic at HAL level: set pixel then refresh immediately.
-  ESP_RETURN_ON_ERROR(led_strip_set_pixel(led_strip_, 0, r, g, b), "ActuatorHal", "RGB set pixel failed");
+  ESP_RETURN_ON_ERROR(led_strip_set_pixel(led_strip_, 0, phys_r, phys_g, phys_b), "ActuatorHal", "RGB set pixel failed");
   return led_strip_refresh(led_strip_);
 }
 

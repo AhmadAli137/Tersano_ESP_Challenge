@@ -1,5 +1,7 @@
 # Managed component dependencies for the `src` component.
-# Keep versions explicit when reproducibility matters across CI/dev machines.
-# This file controls downloadable components (for example from ESP Component Registry).
+#
+# This file is consumed by ESP-IDF's component manager and controls
+# registry-downloaded dependencies for this component only.
+# Pin explicit versions when deterministic CI reproducibility is required.
 dependencies:
   espressif/led_strip: "*"

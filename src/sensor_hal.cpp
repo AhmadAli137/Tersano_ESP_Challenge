@@ -11,6 +11,14 @@
 
 #include "app_config.h"
 
+/*
+ * SensorHal implementation.
+ *
+ * Priority here is resilience:
+ * - if BME280 is unavailable, firmware keeps running with synthetic values
+ * - battery ADC path remains active independently from BME280 state
+ */
+
 namespace {
 constexpr const char* kTag = "SensorHal";
 constexpr i2c_port_t kI2cPort = I2C_NUM_0;
@@ -21,6 +29,7 @@ SensorHal::SensorHal(uint8_t sda_pin, uint8_t scl_pin, uint8_t battery_adc_pin)
     : sda_pin_(sda_pin), scl_pin_(scl_pin), battery_adc_pin_(battery_adc_pin) {}
 
 void SensorHal::begin() {
+  ESP_LOGI(kTag, "Initializing sensor HAL (I2C + ADC)...");
   // Configure master I2C bus shared with BME280.
   i2c_config_t cfg = {};
   cfg.mode = I2C_MODE_MASTER;
@@ -42,10 +51,15 @@ void SensorHal::begin() {
   adc_oneshot_config_channel(adc_handle_, appcfg::BATTERY_ADC_CHANNEL, &chan_cfg);
 
   bme_ok_ = initBme280();
-  ESP_LOGI(kTag, "BME280 init: %s", bme_ok_ ? "ok" : "fallback");
+  if (bme_ok_) {
+    ESP_LOGI(kTag, "BME280 detected and ready");
+  } else {
+    ESP_LOGW(kTag, "BME280 not detected; using fallback simulated sensor values");
+  }
 }
 
 TelemetrySample SensorHal::read(uint32_t seq) {
+  // Build a sample object every call so pipeline keeps monotonic sequence/timestamps.
   TelemetrySample sample = {};
   sample.seq = seq;
   sample.uptime_ms = static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
@@ -117,8 +131,11 @@ bool SensorHal::initBme280() {
   calib_.dig_h5 = static_cast<int16_t>((calib2[5] << 4) | (calib2[4] >> 4));
   calib_.dig_h6 = static_cast<int8_t>(calib2[6]);
 
+  // Humidity oversampling x1.
   if (!writeReg(0xF2, 0x01)) return false;
+  // Temp/pressure oversampling x1, normal mode.
   if (!writeReg(0xF4, 0x27)) return false;
+  // Standby/filter config.
   if (!writeReg(0xF5, 0xA0)) return false;
   return true;
 }

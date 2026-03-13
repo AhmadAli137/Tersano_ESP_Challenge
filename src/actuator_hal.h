@@ -7,9 +7,15 @@
 #include "led_strip.h"
 
 /*
- * ActuatorHal controls user-facing outputs:
+ * ActuatorHal controls user-facing outputs and exposes a minimal, testable API.
+ *
+ * Outputs:
  * - one addressable RGB LED (WS2812/NeoPixel style) on a single GPIO data line
  * - one piezo buzzer driven by LEDC PWM
+ *
+ * Design:
+ * - `begin()` is idempotent
+ * - write methods return esp_err_t so callers can log/recover without crashing
  */
 class ActuatorHal {
  public:

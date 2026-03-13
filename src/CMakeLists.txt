@@ -1,12 +1,17 @@
-# Source list for the `src` component.
+# ESP-IDF component registration for project application sources.
+#
+# Notes:
+# - `src` is used as the component root (instead of default `main` folder)
+# - include paths expose both local headers and shared `include/`
+# - REQUIRES lists direct component dependencies used by these sources
 idf_component_register(
     SRCS
         "main.cpp"
+        "rtu_controller.cpp"
         "actuator_hal.cpp"
         "sensor_hal.cpp"
         "network_hal.cpp"
-        # BacklogStore currently exists in source tree but is not yet integrated
-        # into runtime flow; add "backlog_store.cpp" here when enabling offline queueing.
+        "backlog_store.cpp"
     INCLUDE_DIRS
         "."
         "../include"
@@ -25,4 +30,5 @@ idf_component_register(
         nvs_flash
         json
         mbedtls
+        spiffs
 )
