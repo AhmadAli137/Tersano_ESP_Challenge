@@ -80,9 +80,9 @@ Status LED color is controlled by RTU state:
 
 1. Red: Wi-Fi disconnected.
 2. Yellow: Wi-Fi up but cloud publish path is degraded (repeated failures/stale success window).
-3. Magenta: connected + cloud healthy + sampling interval set to `1000 ms` (1s).
-4. Green: connected + cloud healthy + sampling interval set to `5000 ms` (default 5s).
-5. Blue: connected + cloud healthy + sampling interval set to `10000 ms` (10s).
+3. Magenta: connected + cloud healthy + sampling interval set to `5000 ms` (5 seconds, Fast).
+4. Green: connected + cloud healthy + sampling interval set to `300000 ms` (5 minutes, Default).
+5. Blue: connected + cloud healthy + sampling interval set to `1800000 ms` (30 minutes, Slow).
 
 Blink behavior:
 
@@ -155,9 +155,9 @@ Do not put Supabase secret/service-role key directly in firmware.
 
 Set in `include/app_config.h`:
 
-1. `DEFAULT_SAMPLING_INTERVAL_MS = 5000` (default sample period = 5 seconds).
-2. `MIN_SAMPLING_INTERVAL_MS = 1000`.
-3. `MAX_SAMPLING_INTERVAL_MS = 600000`.
+1. `DEFAULT_SAMPLING_INTERVAL_MS = 300000` (default sample period = 5 minutes).
+2. `MIN_SAMPLING_INTERVAL_MS = 5000` (fast preset floor: 5 seconds).
+3. `MAX_SAMPLING_INTERVAL_MS = 1800000` (slow preset ceiling: 30 minutes).
 4. `COMMAND_POLL_INTERVAL_MS = 1000` (base cadence; adaptive idle backoff in `NetworkHal` may increase it temporarily).
 5. `MAX_BACKLOG_LINES = 2000`.
 
@@ -196,7 +196,7 @@ Firmware command poll query expects:
 
 Supported command payloads (in `device_commands.command` JSON):
 
-1. `{"type":"set_sampling_interval","sampling_interval_ms":5000}`
+1. `{"type":"set_sampling_interval","sampling_interval_ms":300000}`
 2. `{"type":"play_buzzer","frequency":1500,"duration":300}`
 3. `{"type":"toggle_led_blink","enabled":true}`
 
@@ -226,7 +226,7 @@ Example metadata payloads now emitted by firmware:
 1. `boot`: `{"firmware":"<project_ver>","reason":"power_on"}`
 2. `online`: `{"ip":"192.168.x.x","rssi":-42}`
 3. `calibrated`: `{"sensors":["temp","humidity","pressure"]}`
-4. `heartbeat`: `{"status":"healthy|degraded","memory_free":123456}`
+4. `heartbeat`: `{"status":"healthy|degraded"}` (emitted every 30s)
 5. `data_sync`: `{"records":24,"duration_ms":1250}`
 
 ## Build and Flash

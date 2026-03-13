@@ -47,9 +47,9 @@ static constexpr float BATTERY_DIVIDER_RATIO = 2.0f;  // Example 100k/100k divid
 static constexpr uint16_t ADC_MAX = 4095;
 
 // Runtime scheduling defaults and safety bounds.
-static constexpr uint32_t DEFAULT_SAMPLING_INTERVAL_MS = 5000;
-static constexpr uint32_t MIN_SAMPLING_INTERVAL_MS = 1000;
-static constexpr uint32_t MAX_SAMPLING_INTERVAL_MS = 600000;
+static constexpr uint32_t DEFAULT_SAMPLING_INTERVAL_MS = 300000;   // 5 minutes (Default)
+static constexpr uint32_t MIN_SAMPLING_INTERVAL_MS = 5000;         // 5 seconds (Fast preset)
+static constexpr uint32_t MAX_SAMPLING_INTERVAL_MS = 1800000;      // 30 minutes (Slow preset)
 // Base command poll cadence. NetworkHal may apply adaptive backoff when idle.
 static constexpr uint32_t COMMAND_POLL_INTERVAL_MS = 1000;
 

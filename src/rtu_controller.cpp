@@ -7,7 +7,6 @@
 
 #include "cJSON.h"
 #include "driver/gpio.h"
-#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
@@ -17,10 +16,10 @@ namespace {
 constexpr const char* kTag = "RtuController";
 // If this many publish attempts fail in a row, LED shows cloud-degraded state (yellow).
 constexpr uint32_t kCloudFailStreakThreshold = 3;
-// If no successful publish happened for this long, cloud is considered stale/degraded.
-constexpr uint32_t kCloudStaleThresholdMs = 15000;
-// Emit periodic status heartbeat.
-constexpr uint32_t kHeartbeatIntervalMs = 60000;
+// Minimum stale timeout baseline; effective timeout scales with sampling interval.
+constexpr uint32_t kCloudStaleThresholdMinMs = 15000;
+// Emit lightweight periodic status heartbeat every 30s.
+constexpr uint32_t kHeartbeatIntervalMs = 30000;
 // Emit data_sync summary every 30s or after this many flushed rows.
 constexpr uint32_t kSyncSummaryIntervalMs = 30000;
 constexpr uint32_t kSyncSummaryMaxRecords = 25;
@@ -30,6 +29,10 @@ constexpr uint16_t kToneDefaultFreqHz = 1200;
 constexpr uint32_t kToneDefaultDurationMs = 180;
 constexpr uint32_t kLedBlinkPeriodMs = 1000;
 constexpr uint32_t kLedBlinkOnWindowMs = 500;
+// Sampling-rate presets used by LED color policy.
+constexpr uint32_t kSamplingFastMs = 5000;       // 5 seconds
+constexpr uint32_t kSamplingDefaultMs = 300000;  // 5 minutes
+constexpr uint32_t kSamplingSlowMs = 1800000;    // 30 minutes
 
 bool readWifiLinkMeta(char* ip_out, size_t ip_out_len, int* rssi_out) {
   if (!ip_out || ip_out_len == 0 || !rssi_out) return false;
@@ -159,6 +162,7 @@ void RtuController::begin() {
     sample_queue_ = nullptr;
     return;
   }
+  sample_task_handle_ = sample_task;
 
   started_ = true;
   ESP_LOGI(kTag, "RTU controller started (sampling, publish, connectivity, and command tasks active)");
@@ -226,7 +230,8 @@ void RtuController::sampleTask() {
                static_cast<unsigned>(sample_queue_ ? uxQueueMessagesWaiting(sample_queue_) : 0));
       last_alive_log_ms = now_ms;
     }
-    vTaskDelay(pdMS_TO_TICKS(interval));
+    // Sleep until next sample slot, but allow command updates to wake this task early.
+    (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(interval));
   }
 }
 
@@ -391,13 +396,11 @@ void RtuController::connectivityTask() {
     const uint32_t now_hb_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
     if ((now_hb_ms - last_heartbeat_ms_) >= kHeartbeatIntervalMs) {
       const bool degraded = isCloudDegraded(now_hb_ms);
-      const uint32_t mem_free = static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_8BIT));
-      char hb_meta[160];
+      char hb_meta[64];
       std::snprintf(hb_meta,
                     sizeof(hb_meta),
-                    "{\"status\":\"%s\",\"memory_free\":%u}",
-                    degraded ? "degraded" : "healthy",
-                    static_cast<unsigned>(mem_free));
+                    "{\"status\":\"%s\"}",
+                    degraded ? "degraded" : "healthy");
       publishStatusEvent("heartbeat", hb_meta);
       last_heartbeat_ms_ = now_hb_ms;
     }
@@ -424,7 +427,7 @@ void RtuController::commandTask() {
 
 void RtuController::onCommand(const std::string& json) {
   // Commands are expected as JSON object. Supported shapes:
-  // 1) {"type":"set_sampling_interval","sampling_interval_ms":5000}
+  // 1) {"type":"set_sampling_interval","sampling_interval_ms":300000}
   // 2) {"type":"play_buzzer","frequency":1500,"duration":300}
   // 3) {"type":"toggle_led_blink","enabled":true}
   // Legacy compatibility:
@@ -452,12 +455,19 @@ void RtuController::onCommand(const std::string& json) {
                      static_cast<int>(appcfg::MIN_SAMPLING_INTERVAL_MS),
                      static_cast<int>(appcfg::MAX_SAMPLING_INTERVAL_MS)));
       if (cfg_lock_ && xSemaphoreTake(cfg_lock_, pdMS_TO_TICKS(50)) == pdTRUE) {
+        const uint32_t previous = sample_interval_ms_;
         sample_interval_ms_ = bounded;
         xSemaphoreGive(cfg_lock_);
+        if (sample_task_handle_) {
+          xTaskNotifyGive(sample_task_handle_);
+        }
         ok = true;
         applied_type = "set_sampling_interval";
         reason = "applied";
-        ESP_LOGI(kTag, "Command sampling_interval_ms=%" PRIu32, bounded);
+        ESP_LOGI(kTag,
+                 "Command set_sampling_interval: %" PRIu32 "ms -> %" PRIu32 "ms (sampler wake requested)",
+                 previous,
+                 bounded);
       } else {
         reason = "config_lock_timeout";
       }
@@ -507,12 +517,19 @@ void RtuController::onCommand(const std::string& json) {
                      static_cast<int>(appcfg::MIN_SAMPLING_INTERVAL_MS),
                      static_cast<int>(appcfg::MAX_SAMPLING_INTERVAL_MS)));
       if (cfg_lock_ && xSemaphoreTake(cfg_lock_, pdMS_TO_TICKS(50)) == pdTRUE) {
+        const uint32_t previous = sample_interval_ms_;
         sample_interval_ms_ = bounded;
         xSemaphoreGive(cfg_lock_);
+        if (sample_task_handle_) {
+          xTaskNotifyGive(sample_task_handle_);
+        }
         ok = true;
         applied_type = "set_sampling_interval";
         reason = "applied_legacy";
-        ESP_LOGI(kTag, "Legacy command sampling_interval_ms=%" PRIu32, bounded);
+        ESP_LOGI(kTag,
+                 "Legacy command set_sampling_interval: %" PRIu32 "ms -> %" PRIu32 "ms (sampler wake requested)",
+                 previous,
+                 bounded);
       } else {
         reason = "config_lock_timeout";
       }
@@ -541,6 +558,8 @@ void RtuController::onCommand(const std::string& json) {
 
   char meta[256];
   if (ok) {
+    // A successfully handled command implies cloud connectivity is currently healthy.
+    markPublishResult(true);
     std::snprintf(meta,
                   sizeof(meta),
                   "{\"result\":\"pass\",\"type\":\"%s\"}",
@@ -626,18 +645,22 @@ void RtuController::updateStatusRgb() {
     }
 
     // Sampling-rate color map:
-    // - 1s  => magenta
-    // - 5s  => green (default)
-    // - 10s => blue
+    // - 5 seconds   => magenta (fast)
+    // - 5 minutes   => green (default)
+    // - 30 minutes  => blue (slow)
     // Any other cadence falls back to green.
-    if (interval == 1000) {
+    if (interval == kSamplingFastMs) {
       r = 255;
       g = 0;
       b = 255;
-    } else if (interval == 10000) {
+    } else if (interval == kSamplingSlowMs) {
       r = 0;
       g = 0;
       b = 255;
+    } else if (interval == kSamplingDefaultMs) {
+      r = 0;
+      g = 255;
+      b = 0;
     } else {
       r = 0;
       g = 255;
@@ -678,9 +701,21 @@ bool RtuController::isCloudDegraded(uint32_t now_ms) const {
   if (publish_fail_streak_ >= kCloudFailStreakThreshold) {
     return true;
   }
+
+  // Derive staleness window from current sampling cadence to avoid false yellow state
+  // when running intentionally slow sample intervals (for example 5m or 30m presets).
+  uint32_t interval_ms = appcfg::DEFAULT_SAMPLING_INTERVAL_MS;
+  if (cfg_lock_ && xSemaphoreTake(cfg_lock_, pdMS_TO_TICKS(10)) == pdTRUE) {
+    interval_ms = sample_interval_ms_;
+    xSemaphoreGive(cfg_lock_);
+  }
+  const uint32_t interval_scaled = interval_ms > (UINT32_MAX / 2U) ? UINT32_MAX : (interval_ms * 2U);
+  const uint32_t stale_threshold_ms =
+      interval_scaled > kCloudStaleThresholdMinMs ? interval_scaled : kCloudStaleThresholdMinMs;
+
   // Degraded if we have historical success but no recent success.
   if (has_publish_success_) {
-    return (now_ms - last_publish_ok_ms_) > kCloudStaleThresholdMs;
+    return (now_ms - last_publish_ok_ms_) > stale_threshold_ms;
   }
   // During cold boot, do not mark degraded until first success/fail streak evidence exists.
   return false;

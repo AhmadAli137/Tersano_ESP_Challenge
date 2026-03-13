@@ -5,6 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #include "actuator_hal.h"
 #include "app_config.h"
@@ -62,6 +63,7 @@ class RtuController {
   BacklogStore backlog_;
 
   QueueHandle_t sample_queue_ = nullptr;
+  TaskHandle_t sample_task_handle_ = nullptr;
   SemaphoreHandle_t cfg_lock_ = nullptr;
   // Sampling interval may be changed by remote commands; protected by cfg_lock_.
   volatile uint32_t sample_interval_ms_ = appcfg::DEFAULT_SAMPLING_INTERVAL_MS;
