@@ -19,9 +19,15 @@
 namespace {
 constexpr const char* kTag = "NetworkHal";
 constexpr int kWifiConnectedBit = BIT0;
+constexpr size_t kStatusPayloadLogLimit = 240;
 // Process-wide Wi-Fi event group used by isConnected() and event callbacks.
 EventGroupHandle_t g_wifi_event_group = nullptr;
 bool g_wifi_ready = false;
+
+std::string logPreview(const std::string& text, size_t max_len = kStatusPayloadLogLimit) {
+  if (text.size() <= max_len) return text;
+  return text.substr(0, max_len) + "...<truncated>";
+}
 
 // Shared event callback for Wi-Fi + IP state transitions.
 void wifiEventHandler(void*,
@@ -151,11 +157,16 @@ bool NetworkHal::publishStatus(const std::string& payload) {
     return false;
   }
   if (!httpRequest("POST", buildRestPath(status_table_), "application/json", payload, status, nullptr)) {
-    ESP_LOGW(kTag, "Status publish failed: transport/TLS error");
+    ESP_LOGW(kTag,
+             "Status publish failed: transport/TLS error payload=%s",
+             logPreview(payload).c_str());
     return false;
   }
   if (status < 200 || status >= 300) {
-    ESP_LOGW(kTag, "Status publish failed: HTTP status=%d", status);
+    ESP_LOGW(kTag,
+             "Status publish failed: HTTP status=%d payload=%s",
+             status,
+             logPreview(payload).c_str());
     return false;
   }
   return true;

@@ -6,8 +6,11 @@
 
 #include "cJSON.h"
 #include "driver/gpio.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_netif.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 
 namespace {
 constexpr const char* kTag = "RtuController";
@@ -15,6 +18,30 @@ constexpr const char* kTag = "RtuController";
 constexpr uint32_t kCloudFailStreakThreshold = 3;
 // If no successful publish happened for this long, cloud is considered stale/degraded.
 constexpr uint32_t kCloudStaleThresholdMs = 15000;
+// Emit periodic status heartbeat.
+constexpr uint32_t kHeartbeatIntervalMs = 60000;
+// Emit data_sync summary every 30s or after this many flushed rows.
+constexpr uint32_t kSyncSummaryIntervalMs = 30000;
+constexpr uint32_t kSyncSummaryMaxRecords = 25;
+
+bool readWifiLinkMeta(char* ip_out, size_t ip_out_len, int* rssi_out) {
+  if (!ip_out || ip_out_len == 0 || !rssi_out) return false;
+  ip_out[0] = '\0';
+  *rssi_out = 0;
+
+  esp_netif_t* sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  if (!sta) return false;
+
+  esp_netif_ip_info_t ip_info = {};
+  if (esp_netif_get_ip_info(sta, &ip_info) != ESP_OK) return false;
+  std::snprintf(ip_out, ip_out_len, IPSTR, IP2STR(&ip_info.ip));
+
+  wifi_ap_record_t ap_info = {};
+  if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+    *rssi_out = static_cast<int>(ap_info.rssi);
+  }
+  return true;
+}
 }
 
 RtuController::RtuController()
@@ -82,7 +109,15 @@ void RtuController::begin() {
   updateStatusRgb();
 
   // Best-effort startup heartbeat to backend. Failure is non-fatal.
-  net_.publishStatus(statusToJson("boot"));
+#ifndef PROJECT_VER
+#define PROJECT_VER "unknown"
+#endif
+  char boot_meta[192];
+  std::snprintf(boot_meta,
+                sizeof(boot_meta),
+                "{\"firmware\":\"%s\",\"reason\":\"power_on\"}",
+                PROJECT_VER);
+  publishStatusEvent("boot", boot_meta);
 
   TaskHandle_t sample_task = nullptr;
   TaskHandle_t publish_task = nullptr;
@@ -104,6 +139,7 @@ void RtuController::begin() {
 
   started_ = true;
   ESP_LOGI(kTag, "RTU controller started (sampling, publish, and connectivity tasks active)");
+  publishStatusEvent("rtu_started");
 }
 
 void RtuController::loop() {
@@ -142,6 +178,10 @@ void RtuController::sampleTask() {
                sample.pressure_hpa,
                sample.battery_v,
                sample.sensor_ok);
+      if (sample.sensor_ok && !calibration_reported_) {
+        publishStatusEvent("calibrated", "{\"sensors\":[\"temp\",\"humidity\",\"pressure\"]}");
+        calibration_reported_ = true;
+      }
     }
 
     uint32_t interval = appcfg::DEFAULT_SAMPLING_INTERVAL_MS;
@@ -176,24 +216,101 @@ void RtuController::publishTask() {
 }
 
 void RtuController::connectivityTask() {
+  sync_window_start_ms_ = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
   while (true) {
     // Drive network polling state machine (commands, connectivity housekeeping).
     net_.loop();
     updateStatusRgb();
 
+    const bool wifi_connected = net_.isConnected();
+    const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
+    const bool cloud_degraded = isCloudDegraded(now_ms);
+
+    if (!state_event_initialized_) {
+      last_wifi_connected_ = wifi_connected;
+      last_cloud_degraded_ = cloud_degraded;
+      state_event_initialized_ = true;
+      if (wifi_connected) {
+        char ip_str[32];
+        int rssi = 0;
+        char meta[128];
+        if (readWifiLinkMeta(ip_str, sizeof(ip_str), &rssi)) {
+          std::snprintf(meta, sizeof(meta), "{\"ip\":\"%s\",\"rssi\":%d}", ip_str, rssi);
+          publishStatusEvent("online", meta);
+        } else {
+          publishStatusEvent("online");
+        }
+      } else {
+        publishStatusEvent("offline", "{\"reason\":\"wifi_disconnected\"}");
+      }
+      if (cloud_degraded) {
+        publishStatusEvent("cloud_degraded");
+      }
+    } else {
+      if (wifi_connected != last_wifi_connected_) {
+        if (wifi_connected) {
+          char ip_str[32];
+          int rssi = 0;
+          char meta[128];
+          if (readWifiLinkMeta(ip_str, sizeof(ip_str), &rssi)) {
+            std::snprintf(meta, sizeof(meta), "{\"ip\":\"%s\",\"rssi\":%d}", ip_str, rssi);
+            publishStatusEvent("online", meta);
+          } else {
+            publishStatusEvent("online");
+          }
+        } else {
+          publishStatusEvent("offline", "{\"reason\":\"wifi_disconnected\"}");
+        }
+        last_wifi_connected_ = wifi_connected;
+      }
+      if (cloud_degraded != last_cloud_degraded_) {
+        publishStatusEvent(cloud_degraded ? "cloud_degraded" : "cloud_recovered");
+        last_cloud_degraded_ = cloud_degraded;
+      }
+    }
+
     // Drain one backlog row per iteration to avoid monopolizing network time.
-    if (net_.isConnected() && backlog_.countLines() > 0) {
+    if (wifi_connected && backlog_.countLines() > 0) {
       std::string row;
       if (backlog_.popOldestLine(row)) {
         if (net_.publishTelemetry(row)) {
           markPublishResult(true);
+          ++sync_records_in_window_;
           ESP_LOGI(kTag, "Flushed backlog (%u left)", static_cast<unsigned>(backlog_.countLines()));
+          const uint32_t now_sync_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
+          if ((now_sync_ms - sync_window_start_ms_) >= kSyncSummaryIntervalMs ||
+              sync_records_in_window_ >= kSyncSummaryMaxRecords) {
+            const uint32_t duration_ms = static_cast<uint32_t>(now_sync_ms - sync_window_start_ms_);
+            char sync_meta[160];
+            std::snprintf(sync_meta,
+                          sizeof(sync_meta),
+                          "{\"records\":%u,\"duration_ms\":%u}",
+                          static_cast<unsigned>(sync_records_in_window_),
+                          static_cast<unsigned>(duration_ms));
+            publishStatusEvent("data_sync", sync_meta);
+            sync_window_start_ms_ = now_sync_ms;
+            sync_records_in_window_ = 0;
+          }
         } else {
           markPublishResult(false);
           backlog_.prependLine(row);
           vTaskDelay(pdMS_TO_TICKS(500));
         }
       }
+    }
+
+    const uint32_t now_hb_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
+    if ((now_hb_ms - last_heartbeat_ms_) >= kHeartbeatIntervalMs) {
+      const bool degraded = isCloudDegraded(now_hb_ms);
+      const uint32_t mem_free = static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_8BIT));
+      char hb_meta[160];
+      std::snprintf(hb_meta,
+                    sizeof(hb_meta),
+                    "{\"status\":\"%s\",\"memory_free\":%u}",
+                    degraded ? "degraded" : "healthy",
+                    static_cast<unsigned>(mem_free));
+      publishStatusEvent("heartbeat", hb_meta);
+      last_heartbeat_ms_ = now_hb_ms;
     }
     vTaskDelay(pdMS_TO_TICKS(150));
   }
@@ -240,7 +357,12 @@ void RtuController::onCommand(const std::string& json) {
 
   cJSON_Delete(doc);
   // Report command application result to backend for observability.
-  if (changed_any) net_.publishStatus(statusToJson("command_applied"));
+  if (changed_any) publishStatusEvent("command_applied");
+}
+
+void RtuController::publishStatusEvent(const char* event, const std::string& metadata_json) {
+  if (!event || event[0] == '\0') return;
+  net_.publishStatus(statusToJson(event, metadata_json));
 }
 
 std::string RtuController::sampleToJson(const TelemetrySample& sample) const {
@@ -261,16 +383,26 @@ std::string RtuController::sampleToJson(const TelemetrySample& sample) const {
   return std::string(out);
 }
 
-std::string RtuController::statusToJson(const char* event) const {
-  char out[192];
+std::string RtuController::statusToJson(const char* event, const std::string& metadata_json) const {
   const uint64_t uptime_ms = static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
-  std::snprintf(out,
-                sizeof(out),
-                "{\"device_id\":\"%s\",\"event\":\"%s\",\"uptime_ms\":%" PRIu64 "}",
-                appcfg::DEVICE_ID,
-                event,
-                uptime_ms);
-  return std::string(out);
+  cJSON* root = cJSON_CreateObject();
+  if (!root) return "{}";
+  cJSON_AddStringToObject(root, "device_id", appcfg::DEVICE_ID);
+  cJSON_AddStringToObject(root, "event", event ? event : "unknown");
+  cJSON_AddNumberToObject(root, "uptime_ms", static_cast<double>(uptime_ms));
+
+  cJSON* metadata = cJSON_Parse(metadata_json.c_str());
+  if (!metadata || !cJSON_IsObject(metadata)) {
+    if (metadata) cJSON_Delete(metadata);
+    metadata = cJSON_CreateObject();
+  }
+  cJSON_AddItemToObject(root, "metadata", metadata);
+
+  char* encoded = cJSON_PrintUnformatted(root);
+  std::string out = encoded ? encoded : "{}";
+  if (encoded) cJSON_free(encoded);
+  cJSON_Delete(root);
+  return out;
 }
 
 void RtuController::updateStatusRgb() {

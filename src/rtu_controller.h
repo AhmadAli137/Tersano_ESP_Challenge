@@ -42,10 +42,12 @@ class RtuController {
   void publishTask();
   void connectivityTask();
   void onCommand(const std::string& json);
+  // Publish a status-table event row for lifecycle/health observability.
+  void publishStatusEvent(const char* event, const std::string& metadata_json = "{}");
   // Serialize one sample row for Supabase REST insert.
   std::string sampleToJson(const TelemetrySample& sample) const;
   // Serialize status event row for Supabase REST insert.
-  std::string statusToJson(const char* event) const;
+  std::string statusToJson(const char* event, const std::string& metadata_json) const;
   // Tracks rolling cloud publish health for LED status decisions.
   void markPublishResult(bool ok);
   // Returns true when cloud path is considered degraded (Wi-Fi may still be up).
@@ -69,4 +71,12 @@ class RtuController {
   uint32_t last_publish_ok_ms_ = 0;
   uint32_t publish_fail_streak_ = 0;
   bool has_publish_success_ = false;
+  // Transition tracking for status-event emission (avoid per-loop spam).
+  bool state_event_initialized_ = false;
+  bool last_wifi_connected_ = false;
+  bool last_cloud_degraded_ = false;
+  bool calibration_reported_ = false;
+  uint32_t last_heartbeat_ms_ = 0;
+  uint32_t sync_window_start_ms_ = 0;
+  uint32_t sync_records_in_window_ = 0;
 };

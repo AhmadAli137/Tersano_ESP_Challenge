@@ -185,6 +185,24 @@ Firmware command poll query expects:
 4. `limit = 1`
 5. `select = id,command`
 
+### Status table migration (recommended)
+
+Run the included SQL migration to create/align the `status` table used for device event rows:
+
+1. Open Supabase Dashboard -> SQL Editor.
+2. Paste and run:
+   - [`supabase/migrations/001_status_events.sql`](/C:/Users/Ahmad/Desktop/Tersano_ESP_Challenge/supabase/migrations/001_status_events.sql)
+3. Confirm inserts succeed for events like:
+   - `boot`, `rtu_started`, `online`, `offline`, `calibrated`, `heartbeat`, `data_sync`, `cloud_degraded`, `cloud_recovered`, `command_applied`
+
+Example metadata payloads now emitted by firmware:
+
+1. `boot`: `{"firmware":"<project_ver>","reason":"power_on"}`
+2. `online`: `{"ip":"192.168.x.x","rssi":-42}`
+3. `calibrated`: `{"sensors":["temp","humidity","pressure"]}`
+4. `heartbeat`: `{"status":"healthy|degraded","memory_free":123456}`
+5. `data_sync`: `{"records":24,"duration_ms":1250}`
+
 ## Build and Flash
 
 From an ESP-IDF terminal:
