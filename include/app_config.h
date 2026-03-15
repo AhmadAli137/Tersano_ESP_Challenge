@@ -16,20 +16,19 @@
 
 namespace appcfg {
 
-// Stable logical identifier for cloud/backend routing.
-static constexpr const char* DEVICE_ID = "rtu-esp32c5-01";
-
 // Digital IO pin mappings.
-static constexpr gpio_num_t STATUS_LED_PIN = GPIO_NUM_2;
-static constexpr gpio_num_t I2C_SDA_PIN = GPIO_NUM_4;
-static constexpr gpio_num_t I2C_SCL_PIN = GPIO_NUM_5;
-static constexpr gpio_num_t BATTERY_ADC_PIN = GPIO_NUM_0;
-static constexpr adc_channel_t BATTERY_ADC_CHANNEL = ADC_CHANNEL_0;
+// Note: I2C is mapped to GPIO2/GPIO3 to match board silk/LP_I2C labels.
+// STATUS_LED_PIN is moved off GPIO2 to avoid collision with I2C SDA.
+static constexpr gpio_num_t STATUS_LED_PIN = GPIO_NUM_24;
+static constexpr gpio_num_t I2C_SDA_PIN = GPIO_NUM_2;
+static constexpr gpio_num_t I2C_SCL_PIN = GPIO_NUM_3;
+static constexpr gpio_num_t BATTERY_ADC_PIN = GPIO_NUM_6;
+static constexpr adc_channel_t BATTERY_ADC_CHANNEL = ADC_CHANNEL_5;
 
 // Actuator outputs.
 // RGB is a single addressable LED (WS2812/NeoPixel style) on one data pin.
 static constexpr gpio_num_t RGB_DATA_PIN = GPIO_NUM_27;
-static constexpr gpio_num_t PIEZO_PIN = GPIO_NUM_10;
+static constexpr gpio_num_t PIEZO_PIN = GPIO_NUM_26;
 // RGB channel remap for boards/LEDs with non-standard color ordering.
 // Each value is an index into input channels: 0=R, 1=G, 2=B.
 // Example for GRB strips: R_INDEX=1, G_INDEX=0, B_INDEX=2.
@@ -43,7 +42,7 @@ static constexpr uint32_t PIEZO_DEFAULT_FREQ_HZ = 2000;
 
 // ADC conversion constants for battery estimation.
 static constexpr float ADC_REF_VOLTAGE = 3.3f;
-static constexpr float BATTERY_DIVIDER_RATIO = 2.0f;  // Example 100k/100k divider.
+static constexpr float BATTERY_DIVIDER_RATIO = 2.06f;  // Example 10k/10k divider.
 static constexpr uint16_t ADC_MAX = 4095;
 
 // Runtime scheduling defaults and safety bounds.

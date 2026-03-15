@@ -60,6 +60,7 @@ class RtuController {
   SensorHal sensor_;
   ActuatorHal actuator_;
   NetworkHal net_;
+  std::string device_id_;
   BacklogStore backlog_;
 
   QueueHandle_t sample_queue_ = nullptr;

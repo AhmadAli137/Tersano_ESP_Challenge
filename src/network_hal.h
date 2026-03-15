@@ -29,8 +29,7 @@ class NetworkHal {
              const char* supabase_api_key,
              const char* telemetry_table,
              const char* commands_table,
-             const char* status_table,
-             const char* device_id);
+             const char* status_table);
 
   // Initialize Wi-Fi and networking stack once.
   void begin();
@@ -46,6 +45,8 @@ class NetworkHal {
   bool publishStatus(const std::string& payload);
   // Register command callback invoked with JSON command payload.
   void setCommandHandler(CommandHandler cb) { command_handler_ = cb; }
+  // Set resolved runtime device ID (e.g., manual override or MAC-derived).
+  void setDeviceId(const std::string& id) { device_id_ = id; }
 
  private:
   // Generic HTTP helper for GET/POST/PATCH against Supabase.
@@ -72,7 +73,7 @@ class NetworkHal {
   const char* telemetry_table_;
   const char* commands_table_;
   const char* status_table_;
-  const char* device_id_;
+  std::string device_id_;
 
   CommandHandler command_handler_;
   // Last command-poll timestamp in milliseconds since boot.

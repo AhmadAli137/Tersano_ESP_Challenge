@@ -86,16 +86,14 @@ NetworkHal::NetworkHal(const char* wifi_ssid,
                        const char* supabase_api_key,
                        const char* telemetry_table,
                        const char* commands_table,
-                       const char* status_table,
-                       const char* device_id)
+                       const char* status_table)
     : wifi_ssid_(wifi_ssid),
       wifi_pass_(wifi_pass),
       supabase_url_(supabase_url),
       supabase_api_key_(supabase_api_key),
       telemetry_table_(telemetry_table),
       commands_table_(commands_table),
-      status_table_(status_table),
-      device_id_(device_id) {}
+      status_table_(status_table) {}
 
 void NetworkHal::begin() {
   if (!g_wifi_ready) {
@@ -179,12 +177,29 @@ bool NetworkHal::publishTelemetry(const std::string& payload) {
     ESP_LOGW(kTag, "Telemetry publish skipped: Wi-Fi not connected");
     return false;
   }
+  if (payload.empty()) {
+    ESP_LOGW(kTag, "Telemetry publish skipped: empty payload");
+    return false;
+  }
+  const int preview_len = static_cast<int>(
+      payload.size() < kStatusPayloadLogLimit ? payload.size() : kStatusPayloadLogLimit);
   if (!httpRequest("POST", buildRestPath(telemetry_table_), "application/json", payload, status, nullptr)) {
-    ESP_LOGW(kTag, "Telemetry publish failed: transport/TLS error");
+    ESP_LOGW(kTag,
+             "Telemetry publish failed: transport/TLS error payload(%uB)=%.*s%s",
+             static_cast<unsigned>(payload.size()),
+             preview_len,
+             payload.c_str(),
+             payload.size() > kStatusPayloadLogLimit ? "...<truncated>" : "");
     return false;
   }
   if (status < 200 || status >= 300) {
-    ESP_LOGW(kTag, "Telemetry publish failed: HTTP status=%d", status);
+    ESP_LOGW(kTag,
+             "Telemetry publish failed: HTTP status=%d payload(%uB)=%.*s%s",
+             status,
+             static_cast<unsigned>(payload.size()),
+             preview_len,
+             payload.c_str(),
+             payload.size() > kStatusPayloadLogLimit ? "...<truncated>" : "");
     return false;
   }
   return true;
@@ -315,6 +330,10 @@ bool NetworkHal::httpRequest(const char* method,
 bool NetworkHal::pollCommand(bool* had_pending_command) {
   if (had_pending_command) *had_pending_command = false;
   if (!command_handler_) return false;
+  if (device_id_.empty()) {
+    ESP_LOGW(kTag, "Command poll skipped: device_id is not set");
+    return false;
+  }
 
   int status = 0;
   std::string response;

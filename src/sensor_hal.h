@@ -4,6 +4,7 @@
 #include <cstddef>
 
 #include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
 
 #include "app_types.h"
 
@@ -13,7 +14,7 @@
  * Current implementation:
  * - BME280 over I2C for temperature/humidity/pressure
  * - ADC one-shot for battery voltage
- * - synthetic fallback values when BME280 is unavailable
+ * - emits N/A (NaN) values when BME280 is unavailable
  */
 class SensorHal {
  public:
@@ -67,9 +68,6 @@ class SensorHal {
   // BME280 compensation intermediate shared across T/P/H calculations.
   int32_t t_fine_ = 0;
   adc_oneshot_unit_handle_t adc_handle_ = nullptr;
-
-  // Deterministic fallback values when physical sensor is absent/faulted.
-  float fake_temp_ = 23.0f;
-  float fake_hum_ = 55.0f;
-  float fake_pressure_ = 1009.0f;
+  adc_cali_handle_t adc_cali_handle_ = nullptr;
+  bool adc_cali_enabled_ = false;
 };

@@ -4,10 +4,12 @@
 #include <cinttypes>
 #include <cstring>
 #include <cstdio>
+#include <cmath>
 
 #include "cJSON.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -52,6 +54,57 @@ bool readWifiLinkMeta(char* ip_out, size_t ip_out_len, int* rssi_out) {
   }
   return true;
 }
+
+bool isValidJsonObject(const std::string& text) {
+  if (text.empty()) return false;
+  cJSON* parsed = cJSON_Parse(text.c_str());
+  const bool ok = parsed && cJSON_IsObject(parsed);
+  if (parsed) cJSON_Delete(parsed);
+  return ok;
+}
+
+bool playBuzzerPreset(ActuatorHal& actuator, const char* preset) {
+  if (!preset) return false;
+
+  // Distinct short motifs for operator feedback levels.
+  if (std::strcmp(preset, "alert") == 0) {
+    // Sharp, urgent descending 4-tone burst.
+    if (actuator.playTone(1568, 90) != ESP_OK) return false;
+    vTaskDelay(pdMS_TO_TICKS(25));
+    if (actuator.playTone(1319, 90) != ESP_OK) return false;
+    vTaskDelay(pdMS_TO_TICKS(25));
+    if (actuator.playTone(1047, 100) != ESP_OK) return false;
+    vTaskDelay(pdMS_TO_TICKS(25));
+    return actuator.playTone(784, 170) == ESP_OK;
+  }
+  if (std::strcmp(preset, "warning") == 0) {
+    // Mid-priority pulsing caution motif.
+    if (actuator.playTone(880, 120) != ESP_OK) return false;
+    vTaskDelay(pdMS_TO_TICKS(60));
+    if (actuator.playTone(880, 120) != ESP_OK) return false;
+    vTaskDelay(pdMS_TO_TICKS(60));
+    return actuator.playTone(659, 180) == ESP_OK;
+  }
+  if (std::strcmp(preset, "success") == 0) {
+    // Friendly rising arpeggio.
+    if (actuator.playTone(523, 80) != ESP_OK) return false;
+    vTaskDelay(pdMS_TO_TICKS(30));
+    if (actuator.playTone(659, 80) != ESP_OK) return false;
+    vTaskDelay(pdMS_TO_TICKS(30));
+    if (actuator.playTone(784, 80) != ESP_OK) return false;
+    vTaskDelay(pdMS_TO_TICKS(30));
+    return actuator.playTone(1047, 140) == ESP_OK;
+  }
+  return false;
+}
+
+std::string resolveDeviceId() {
+  if (secrets::DEVICE_ID && secrets::DEVICE_ID[0] != '\0') {
+    return std::string(secrets::DEVICE_ID);
+  }
+
+  return "rtu-esp32c5-unassigned";
+}
 }
 
 RtuController::RtuController()
@@ -67,8 +120,10 @@ RtuController::RtuController()
            secrets::SUPABASE_API_KEY,
            appcfg::TABLE_TELEMETRY,
            appcfg::TABLE_COMMANDS,
-           appcfg::TABLE_STATUS,
-           appcfg::DEVICE_ID) {}
+           appcfg::TABLE_STATUS),
+      device_id_(resolveDeviceId()) {
+  net_.setDeviceId(device_id_);
+}
 
 void RtuController::begin() {
   // begin() can be called multiple times by bootstrap logic; initialize exactly once.
@@ -84,6 +139,18 @@ void RtuController::begin() {
   gpio_set_level(appcfg::STATUS_LED_PIN, 0);
 
   ESP_LOGI(kTag, "Booting RTU...");
+  uint8_t mac[6] = {0};
+  if (esp_efuse_mac_get_default(mac) == ESP_OK) {
+    ESP_LOGI(kTag,
+             "Base MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  } else {
+    ESP_LOGW(kTag, "Base MAC: unavailable");
+  }
+  if (device_id_ == "rtu-esp32c5-unassigned") {
+    ESP_LOGW(kTag, "DEVICE_ID is not set in secrets.h; using fallback '%s'", device_id_.c_str());
+  }
+  ESP_LOGI(kTag, "Device identity: %s", device_id_.c_str());
   ESP_LOGI(kTag, "Initializing actuator, sensor, network, and backlog subsystems");
 
   if (actuator_.begin() != ESP_OK) {
@@ -202,12 +269,21 @@ void RtuController::sampleTask() {
     if (xQueueSend(sample_queue_, &sample, pdMS_TO_TICKS(50)) != pdPASS) {
       ESP_LOGW(kTag, "Sample queue full, dropping");
     } else {
+      char t_buf[32];
+      char h_buf[32];
+      char p_buf[32];
+      if (std::isnan(sample.temperature_c)) std::snprintf(t_buf, sizeof(t_buf), "N/A");
+      else std::snprintf(t_buf, sizeof(t_buf), "%.2fC", sample.temperature_c);
+      if (std::isnan(sample.humidity_pct)) std::snprintf(h_buf, sizeof(h_buf), "N/A");
+      else std::snprintf(h_buf, sizeof(h_buf), "%.2f%%", sample.humidity_pct);
+      if (std::isnan(sample.pressure_hpa)) std::snprintf(p_buf, sizeof(p_buf), "N/A");
+      else std::snprintf(p_buf, sizeof(p_buf), "%.2fhPa", sample.pressure_hpa);
       ESP_LOGI(kTag,
-               "Sample #%" PRIu32 ": T=%.2fC H=%.2f%% P=%.2fhPa Vbat=%.2fV sensor_ok=%d",
+               "Sample #%" PRIu32 ": T=%s H=%s P=%s Vbat=%.2fV sensor_ok=%d",
                sample.seq,
-               sample.temperature_c,
-               sample.humidity_pct,
-               sample.pressure_hpa,
+               t_buf,
+               h_buf,
+               p_buf,
                sample.battery_v,
                sample.sensor_ok);
       if (sample.sensor_ok && !calibration_reported_) {
@@ -356,6 +432,13 @@ void RtuController::connectivityTask() {
       last_flush_attempt_ms = now_ms;
       std::string row;
       if (backlog_.popOldestLine(row)) {
+        if (!isValidJsonObject(row)) {
+          ESP_LOGW(kTag,
+                   "Dropped malformed backlog row (%uB): %s",
+                   static_cast<unsigned>(row.size()),
+                   row.empty() ? "<empty>" : row.c_str());
+          continue;
+        }
         if (net_.publishTelemetry(row)) {
           markPublishResult(true);
           ++sync_records_in_window_;
@@ -429,10 +512,12 @@ void RtuController::onCommand(const std::string& json) {
   // Commands are expected as JSON object. Supported shapes:
   // 1) {"type":"set_sampling_interval","sampling_interval_ms":300000}
   // 2) {"type":"play_buzzer","frequency":1500,"duration":300}
-  // 3) {"type":"toggle_led_blink","enabled":true}
+  // 3) {"type":"play_buzzer","preset":"alert|warning|success"}
+  // 4) {"type":"toggle_led_blink","enabled":true}
+  // 5) {"type":"alert"} | {"type":"warning"} | {"type":"success"}
   // Legacy compatibility:
-  // 4) {"sampling_interval_ms":10000}
-  // 5) {"buzzer":{"on":true,"frequency_hz":1200}}
+  // 6) {"sampling_interval_ms":10000}
+  // 7) {"buzzer":{"on":true,"frequency_hz":1200}}
   cJSON* doc = cJSON_Parse(json.c_str());
   if (!doc) {
     ESP_LOGW(kTag, "Invalid command JSON");
@@ -475,6 +560,16 @@ void RtuController::onCommand(const std::string& json) {
       reason = "invalid_sampling_interval_ms";
     }
   } else if (type && std::strcmp(type, "play_buzzer") == 0) {
+    cJSON* preset = cJSON_GetObjectItem(doc, "preset");
+    if (!preset) preset = cJSON_GetObjectItem(doc, "tone");
+    if (!preset) preset = cJSON_GetObjectItem(doc, "level");
+    if (cJSON_IsString(preset) && preset->valuestring &&
+        playBuzzerPreset(actuator_, preset->valuestring)) {
+      ok = true;
+      applied_type = "play_buzzer";
+      reason = "applied";
+      ESP_LOGI(kTag, "Command play_buzzer preset=%s", preset->valuestring);
+    } else {
     cJSON* freq = cJSON_GetObjectItem(doc, "frequency");
     cJSON* duration = cJSON_GetObjectItem(doc, "duration");
     const uint16_t tone_f = cJSON_IsNumber(freq)
@@ -488,6 +583,19 @@ void RtuController::onCommand(const std::string& json) {
       applied_type = "play_buzzer";
       reason = "applied";
       ESP_LOGI(kTag, "Command play_buzzer freq=%u duration_ms=%u", tone_f, tone_d);
+    } else {
+      reason = "actuator_buzzer_failed";
+    }
+    }
+  } else if (type &&
+             (std::strcmp(type, "alert") == 0 ||
+              std::strcmp(type, "warning") == 0 ||
+              std::strcmp(type, "success") == 0)) {
+    if (playBuzzerPreset(actuator_, type)) {
+      ok = true;
+      applied_type = "play_buzzer";
+      reason = "applied";
+      ESP_LOGI(kTag, "Command buzzer preset type=%s", type);
     } else {
       reason = "actuator_buzzer_failed";
     }
@@ -582,30 +690,41 @@ void RtuController::publishStatusEvent(const char* event, const std::string& met
 }
 
 std::string RtuController::sampleToJson(const TelemetrySample& sample) const {
-  char out[384];
-  std::snprintf(out,
-                sizeof(out),
-                "{\"device_id\":\"%s\",\"seq\":%" PRIu32 ",\"uptime_ms\":%" PRIu64
-                ",\"temperature_c\":%.2f,\"humidity_pct\":%.2f,\"pressure_hpa\":%.2f,"
-                "\"battery_v\":%.2f,\"sensor_ok\":%s}",
-                appcfg::DEVICE_ID,
-                sample.seq,
-                sample.uptime_ms,
-                sample.temperature_c,
-                sample.humidity_pct,
-                sample.pressure_hpa,
-                sample.battery_v,
-                sample.sensor_ok ? "true" : "false");
-  return std::string(out);
+  cJSON* root = cJSON_CreateObject();
+  if (!root) return "{}";
+  cJSON_AddStringToObject(root, "device_id", device_id_.c_str());
+  cJSON_AddNumberToObject(root, "seq", static_cast<double>(sample.seq));
+  cJSON_AddNumberToObject(root, "uptime_ms", static_cast<double>(sample.uptime_ms));
+  if (std::isnan(sample.temperature_c)) cJSON_AddNullToObject(root, "temperature_c");
+  else cJSON_AddNumberToObject(root, "temperature_c", sample.temperature_c);
+  if (std::isnan(sample.humidity_pct)) cJSON_AddNullToObject(root, "humidity_pct");
+  else cJSON_AddNumberToObject(root, "humidity_pct", sample.humidity_pct);
+  if (std::isnan(sample.pressure_hpa)) cJSON_AddNullToObject(root, "pressure_hpa");
+  else cJSON_AddNumberToObject(root, "pressure_hpa", sample.pressure_hpa);
+  if (std::isnan(sample.battery_v)) cJSON_AddNullToObject(root, "battery_v");
+  else cJSON_AddNumberToObject(root, "battery_v", sample.battery_v);
+  cJSON_AddBoolToObject(root, "sensor_ok", sample.sensor_ok);
+  char* encoded = cJSON_PrintUnformatted(root);
+  std::string out = encoded ? encoded : "{}";
+  if (encoded) cJSON_free(encoded);
+  cJSON_Delete(root);
+  return out;
 }
 
 std::string RtuController::statusToJson(const char* event, const std::string& metadata_json) const {
   const uint64_t uptime_ms = static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
+  uint32_t interval_ms = appcfg::DEFAULT_SAMPLING_INTERVAL_MS;
+  if (cfg_lock_ && xSemaphoreTake(cfg_lock_, pdMS_TO_TICKS(20)) == pdTRUE) {
+    interval_ms = sample_interval_ms_;
+    xSemaphoreGive(cfg_lock_);
+  }
   cJSON* root = cJSON_CreateObject();
   if (!root) return "{}";
-  cJSON_AddStringToObject(root, "device_id", appcfg::DEVICE_ID);
+  cJSON_AddStringToObject(root, "device_id", device_id_.c_str());
   cJSON_AddStringToObject(root, "event", event ? event : "unknown");
   cJSON_AddNumberToObject(root, "uptime_ms", static_cast<double>(uptime_ms));
+  cJSON_AddNumberToObject(root, "sample_rate_ms", static_cast<double>(interval_ms));
+  cJSON_AddBoolToObject(root, "blink_on", led_blink_enabled_);
 
   cJSON* metadata = cJSON_Parse(metadata_json.c_str());
   if (!metadata || !cJSON_IsObject(metadata)) {

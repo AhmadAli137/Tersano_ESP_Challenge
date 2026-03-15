@@ -3,7 +3,8 @@
 --   Create/align the `public.status` table for RTU device lifecycle events.
 --
 -- Firmware currently inserts:
---   device_id (text), event (text), uptime_ms (bigint)
+--   device_id (text), event (text), uptime_ms (bigint),
+--   sample_rate_ms (bigint), blink_on (boolean)
 --
 -- Optional field:
 --   metadata (jsonb) for future event context from web/firmware.
@@ -16,12 +17,20 @@ create table if not exists public.status (
   device_id text not null,
   event text not null,
   uptime_ms bigint not null,
+  sample_rate_ms bigint not null default 300000,
+  blink_on boolean not null default false,
   metadata jsonb not null default '{}'::jsonb
 );
 
 -- If table existed before without metadata column, add it safely.
 alter table public.status
   add column if not exists metadata jsonb not null default '{}'::jsonb;
+
+alter table public.status
+  add column if not exists sample_rate_ms bigint not null default 300000;
+
+alter table public.status
+  add column if not exists blink_on boolean not null default false;
 
 -- Helpful indexes for dashboard/time-series queries.
 create index if not exists idx_status_device_created_at

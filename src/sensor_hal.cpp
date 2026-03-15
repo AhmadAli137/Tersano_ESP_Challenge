@@ -4,7 +4,10 @@
 #include <cmath>
 
 #include "driver/i2c.h"
+#include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -15,7 +18,7 @@
  * SensorHal implementation.
  *
  * Priority here is resilience:
- * - if BME280 is unavailable, firmware keeps running with synthetic values
+ * - if BME280 is unavailable, firmware keeps running and reports N/A values
  * - battery ADC path remains active independently from BME280 state
  */
 
@@ -23,6 +26,38 @@ namespace {
 constexpr const char* kTag = "SensorHal";
 constexpr i2c_port_t kI2cPort = I2C_NUM_0;
 constexpr uint32_t kI2cFreqHz = 100000;
+constexpr uint32_t kBatteryDiagLogIntervalMs = 10000;
+
+bool initAdcCalibration(adc_unit_t unit, adc_atten_t atten, adc_cali_handle_t* out_handle) {
+  if (!out_handle) return false;
+  *out_handle = nullptr;
+
+  adc_cali_scheme_ver_t scheme_mask = static_cast<adc_cali_scheme_ver_t>(0);
+  if (adc_cali_check_scheme(&scheme_mask) != ESP_OK) return false;
+
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+  if (scheme_mask & ADC_CALI_SCHEME_VER_CURVE_FITTING) {
+    adc_cali_curve_fitting_config_t cfg = {};
+    cfg.unit_id = unit;
+    cfg.atten = atten;
+    cfg.bitwidth = ADC_BITWIDTH_DEFAULT;
+    if (adc_cali_create_scheme_curve_fitting(&cfg, out_handle) == ESP_OK) return true;
+  }
+#endif
+
+#if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+  if (scheme_mask & ADC_CALI_SCHEME_VER_LINE_FITTING) {
+    adc_cali_line_fitting_config_t cfg = {};
+    cfg.unit_id = unit;
+    cfg.atten = atten;
+    cfg.bitwidth = ADC_BITWIDTH_DEFAULT;
+    cfg.default_vref = 0;
+    if (adc_cali_create_scheme_line_fitting(&cfg, out_handle) == ESP_OK) return true;
+  }
+#endif
+
+  return false;
+}
 }  // namespace
 
 SensorHal::SensorHal(uint8_t sda_pin, uint8_t scl_pin, uint8_t battery_adc_pin)
@@ -49,12 +84,21 @@ void SensorHal::begin() {
   chan_cfg.atten = ADC_ATTEN_DB_12;
   chan_cfg.bitwidth = ADC_BITWIDTH_12;
   adc_oneshot_config_channel(adc_handle_, appcfg::BATTERY_ADC_CHANNEL, &chan_cfg);
+  // Keep ADC pin high-impedance: internal pulls can bias high-value divider readings.
+  gpio_pullup_dis(static_cast<gpio_num_t>(battery_adc_pin_));
+  gpio_pulldown_dis(static_cast<gpio_num_t>(battery_adc_pin_));
+  adc_cali_enabled_ = initAdcCalibration(ADC_UNIT_1, chan_cfg.atten, &adc_cali_handle_);
+  if (adc_cali_enabled_) {
+    ESP_LOGI(kTag, "ADC calibration enabled for battery channel");
+  } else {
+    ESP_LOGW(kTag, "ADC calibration unavailable; using raw ADC conversion fallback");
+  }
 
   bme_ok_ = initBme280();
   if (bme_ok_) {
     ESP_LOGI(kTag, "BME280 detected and ready");
   } else {
-    ESP_LOGW(kTag, "BME280 not detected; using fallback simulated sensor values");
+    ESP_LOGW(kTag, "BME280 not detected; environmental fields will be reported as N/A");
   }
 }
 
@@ -73,18 +117,7 @@ TelemetrySample SensorHal::read(uint32_t seq) {
     sample.sensor_ok = true;
     return sample;
   }
-
-  // Fallback waveform keeps downstream pipeline exercised without hard failure.
-  fake_temp_ += 0.05f;
-  if (fake_temp_ > 27.0f) fake_temp_ = 23.0f;
-  fake_hum_ += 0.08f;
-  if (fake_hum_ > 63.0f) fake_hum_ = 55.0f;
-  fake_pressure_ += 0.09f;
-  if (fake_pressure_ > 1019.0f) fake_pressure_ = 1009.0f;
-
-  sample.temperature_c = fake_temp_;
-  sample.humidity_pct = fake_hum_;
-  sample.pressure_hpa = fake_pressure_;
+  // Keep NAN defaults for environmental fields to represent "N/A".
   sample.sensor_ok = false;
   return sample;
 }
@@ -185,9 +218,34 @@ bool SensorHal::readBme280(float& temperature_c, float& humidity_pct, float& pre
 }
 
 float SensorHal::readBatteryVoltage() const {
+  static uint32_t s_last_diag_ms = 0;
   int raw = 0;
   if (adc_oneshot_read(adc_handle_, appcfg::BATTERY_ADC_CHANNEL, &raw) != ESP_OK) return NAN;
-  // Convert ADC code -> pin voltage -> pre-divider battery voltage.
-  const float adc_v = (static_cast<float>(raw) / static_cast<float>(appcfg::ADC_MAX)) * appcfg::ADC_REF_VOLTAGE;
-  return adc_v * appcfg::BATTERY_DIVIDER_RATIO;
+
+  float adc_v = NAN;
+  int adc_mv = -1;
+  if (adc_cali_enabled_ && adc_cali_handle_) {
+    if (adc_cali_raw_to_voltage(adc_cali_handle_, raw, &adc_mv) == ESP_OK) {
+      adc_v = static_cast<float>(adc_mv) / 1000.0f;
+    }
+  }
+  if (std::isnan(adc_v)) {
+    // Fallback conversion when calibration is unavailable.
+    adc_v = (static_cast<float>(raw) / static_cast<float>(appcfg::ADC_MAX)) * appcfg::ADC_REF_VOLTAGE;
+  }
+
+  // Convert ADC pin voltage -> pre-divider battery voltage.
+  const float battery_v = adc_v * appcfg::BATTERY_DIVIDER_RATIO;
+  const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
+  if ((now_ms - s_last_diag_ms) >= kBatteryDiagLogIntervalMs) {
+    ESP_LOGI(kTag,
+             "Battery ADC diag: raw=%d adc_mv=%d adc_pin=%.3fV ratio=%.3f battery=%.3fV",
+             raw,
+             adc_mv,
+             adc_v,
+             appcfg::BATTERY_DIVIDER_RATIO,
+             battery_v);
+    s_last_diag_ms = now_ms;
+  }
+  return battery_v;
 }

@@ -119,12 +119,12 @@ Because backlog is enabled, data is still preserved and retried later.
 Current pin/config defaults are in `include/app_config.h`:
 
 1. ESP32-C5 board (tested on 16 MB flash variant).
-2. Status GPIO LED: `GPIO2`.
+2. Status GPIO LED: `GPIO24`.
 3. RGB (addressable LED data): `GPIO27`.
-4. Piezo buzzer (LEDC PWM): `GPIO10`.
-5. I2C SDA: `GPIO4`.
-6. I2C SCL: `GPIO5`.
-7. Battery ADC input: `GPIO0`.
+4. Piezo buzzer (LEDC PWM): `GPIO26`.
+5. I2C SDA: `GPIO2`.
+6. I2C SCL: `GPIO3`.
+7. Battery ADC input: `GPIO6` (`ADC1_CH5`).
 
 ## Project Layout
 
@@ -188,11 +188,20 @@ At minimum:
 
 Firmware command poll query expects:
 
-1. `device_id = eq.<DEVICE_ID>`
+1. `device_id = eq.<runtime device id>`
 2. `processed = eq.false`
 3. `order = id.asc`
 4. `limit = 1`
 5. `select = *` (firmware accepts `command` or fallback `payload` JSON fields)
+
+### Device ID behavior
+
+Device ID is explicitly assigned per build:
+
+1. Set `secrets::DEVICE_ID` in `include/secrets.h` before flashing each board.
+2. If left empty, firmware uses fallback `rtu-esp32c5-unassigned` and logs a warning.
+
+This means you do not map IDs to COM ports. Identity is an explicit provisioning choice.
 
 Supported command payloads (in `device_commands.command` JSON):
 
@@ -229,6 +238,11 @@ Example metadata payloads now emitted by firmware:
 4. `heartbeat`: `{"status":"healthy|degraded"}` (emitted every 30s)
 5. `data_sync`: `{"records":24,"duration_ms":1250}`
 
+Status rows also include top-level runtime state fields:
+
+1. `sample_rate_ms` (current sampling interval in milliseconds)
+2. `blink_on` (current LED blink state)
+
 ## Build and Flash
 
 From an ESP-IDF terminal:
@@ -246,10 +260,10 @@ If `idf.py` is not found, open the command prompt from your ESP-IDF environment 
 
 `partitions.csv` uses:
 
-1. `factory` app partition: `0x600000` (6 MB)
-2. `spiffs` data partition: `0x200000` (2 MB)
+1. `factory` app partition: `0x280000` (2.5 MB)
+2. `spiffs` data partition: `0x170000` (1.5 MB)
 
-This is why your large binary builds while still keeping local backlog storage.
+This layout is 4MB-flash safe and also works on larger-flash boards.
 
 ## Boot and Runtime Sequence
 
@@ -306,7 +320,7 @@ Action:
 
 Log:
 
-1. `BME280 not detected; using fallback simulated sensor values`
+1. `BME280 not detected; environmental fields will be reported as N/A`
 
 Cause:
 
@@ -315,7 +329,7 @@ Cause:
 Action:
 
 1. Verify I2C wiring, pull-ups, device address.
-2. Sensor fallback is expected until fixed.
+2. Environmental telemetry fields will be `null`/`N/A` until fixed.
 
 ### Symptom: monitor disconnect (`ClearCommError`)
 
@@ -332,7 +346,7 @@ Action:
 ## Current Known Limitations
 
 1. Sensor HAL currently keeps legacy I2C driver include path (`driver/i2c.h` warning).
-2. Sensor fallback mode can hide missing hardware unless logs are monitored.
+2. Missing BME280 reports `N/A` environmental fields and `sensor_ok=false`.
 3. Security hardening is intentionally deferred while bring-up remains active.
 
 ## Security Hardening Roadmap

@@ -20,4 +20,9 @@ static constexpr const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
 static constexpr const char* SUPABASE_URL = "https://YOUR_PROJECT_ID.supabase.co";
 static constexpr const char* SUPABASE_API_KEY = "YOUR_SUPABASE_PUBLISHABLE_KEY";
 
+// Required per-build board identity.
+// Set this intentionally before flashing each board.
+// Example: "rtu-esp32c5-01"
+static constexpr const char* DEVICE_ID = "";
+
 }  // namespace secrets
