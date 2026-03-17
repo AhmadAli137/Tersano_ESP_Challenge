@@ -156,7 +156,7 @@ Do not put Supabase secret/service-role key directly in firmware.
 
 1. Keep `DEVICE_ID` stable for the same board across reflashes to preserve history continuity.
 2. Use a different `DEVICE_ID` for each board to avoid mixed telemetry/commands.
-3. If left empty, firmware falls back to `rtu-esp32c5-unassigned` and logs a warning.
+3. If left empty, firmware falls back to MAC-derived identity `rtu-esp32c5-<MAC_LAST_3_BYTES_HEX>` and logs a warning.
 
 ### App behavior and timing
 
@@ -232,7 +232,7 @@ Firmware command poll query expects:
 Device ID is explicitly assigned per build:
 
 1. Set `secrets::DEVICE_ID` in `include/secrets.h` before flashing each board.
-2. If left empty, firmware uses fallback `rtu-esp32c5-unassigned` and logs a warning.
+2. If left empty, firmware uses fallback `rtu-esp32c5-<MAC_LAST_3_BYTES_HEX>` and logs a warning.
 
 This means you do not map IDs to COM ports. Identity is an explicit provisioning choice.
 

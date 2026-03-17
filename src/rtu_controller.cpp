@@ -39,6 +39,7 @@ constexpr uint32_t kSamplingDefaultMs = 300000;  // 5 minutes
 constexpr uint32_t kSamplingSlowMs = 1800000;    // 30 minutes
 constexpr const char* kNvsNamespace = "rtu";
 constexpr const char* kBootIdKey = "boot_id";
+constexpr const char* kDeviceIdFallbackPrefix = "rtu-esp32c5-";
 
 uint64_t loadAndIncrementBootId() {
   nvs_handle_t nvs = 0;
@@ -169,7 +170,14 @@ std::string resolveDeviceId() {
     return std::string(secrets::DEVICE_ID);
   }
 
-  return "rtu-esp32c5-unassigned";
+  uint8_t mac[6] = {0};
+  if (esp_efuse_mac_get_default(mac) != ESP_OK) {
+    return std::string(kDeviceIdFallbackPrefix) + "unknown";
+  }
+
+  char suffix[7] = {0};
+  std::snprintf(suffix, sizeof(suffix), "%02X%02X%02X", mac[3], mac[4], mac[5]);
+  return std::string(kDeviceIdFallbackPrefix) + suffix;
 }
 }
 
@@ -213,8 +221,9 @@ void RtuController::begin() {
   } else {
     ESP_LOGW(kTag, "Base MAC: unavailable");
   }
-  if (device_id_ == "rtu-esp32c5-unassigned") {
-    ESP_LOGW(kTag, "DEVICE_ID is not set in secrets.h; using fallback '%s'", device_id_.c_str());
+  if (!secrets::DEVICE_ID || secrets::DEVICE_ID[0] == '\0') {
+    ESP_LOGW(kTag, "DEVICE_ID is not set in secrets.h; using MAC-derived fallback '%s'",
+             device_id_.c_str());
   }
   ESP_LOGI(kTag, "Device identity: %s", device_id_.c_str());
   ESP_LOGI(kTag, "Initializing actuator, sensor, network, and backlog subsystems");
