@@ -103,10 +103,11 @@ Because backlog is enabled, data is still preserved and retried later.
 ## Quick Start
 
 1. Copy `include/secrets.example.h` to `include/secrets.h`.
-2. Fill Wi-Fi + Supabase values.
-3. Ensure Supabase tables exist and names match `include/app_config.h`.
-4. Build and flash.
-5. Watch monitor logs for healthy startup and publish/flush behavior.
+2. Fill Wi-Fi + Supabase values and set `DEVICE_ID`.
+3. Use a unique `DEVICE_ID` per physical board before each flash/provision.
+4. Ensure Supabase tables exist and names match `include/app_config.h`.
+5. Build and flash.
+6. Watch monitor logs for healthy startup and publish/flush behavior.
 
 ## Hardware Target
 
@@ -142,8 +143,15 @@ Set in `include/secrets.h`:
 2. `WIFI_PASS`
 3. `SUPABASE_URL` format: `https://<project-ref>.supabase.co`
 4. `SUPABASE_API_KEY`: use publishable/anon-style key for current firmware model
+5. `DEVICE_ID`: required runtime identity for telemetry/status rows and command targeting
 
 Do not put Supabase secret/service-role key directly in firmware.
+
+`DEVICE_ID` guidance:
+
+1. Keep `DEVICE_ID` stable for the same board across reflashes to preserve history continuity.
+2. Use a different `DEVICE_ID` for each board to avoid mixed telemetry/commands.
+3. If left empty, firmware falls back to `rtu-esp32c5-unassigned` and logs a warning.
 
 ### App behavior and timing
 
