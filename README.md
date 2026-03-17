@@ -90,12 +90,6 @@ Blink behavior:
 2. Blinking applies to whatever status color is currently active.
 3. Blink cadence is 1 second period, 50% duty.
 
-Why you may still see mostly green:
-
-1. Short transient failures can recover before degradation threshold is crossed.
-2. Successful sends reset failure streak.
-3. If failures are occasional, system returns to healthy state quickly.
-
 ## Intermittent Publish Failures (Why They Happen)
 
 You may still see occasional lines like:
