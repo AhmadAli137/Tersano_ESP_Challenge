@@ -179,6 +179,32 @@ At minimum:
 2. `status` table: accepts fields from `statusToJson`.
 3. `device_commands` table: expected by polling path.
 
+Telemetry lineage fields emitted by firmware:
+
+1. `captured_uptime_ms`: uptime when sample was taken on device.
+2. `published_uptime_ms`: uptime when sample was actually sent to cloud.
+3. `captured_boot_id`: persistent boot session counter at capture time.
+4. `published_boot_id`: persistent boot session counter at publish time.
+5. `captured_unix_ms`: device wall-clock timestamp at capture time when available; `null` when unsynchronized.
+6. `was_cached`: `true` when row was replayed from backlog, else `false`.
+
+### Telemetry timestamp semantics (important)
+
+`telemetry.created_at` is assigned by Supabase when the row is inserted, which means:
+
+1. For live rows, `created_at` is near the actual sensor capture time.
+2. For backlog rows, `created_at` reflects replay time, not original capture time.
+
+Uptime lineage fields let you recover capture timing when the device has not rebooted between capture and publish:
+
+1. Capture timestamp estimate formula:
+   - `estimated_capture_time = created_at - (published_uptime_ms - captured_uptime_ms)`
+2. This formula is valid only when:
+   - `captured_boot_id = published_boot_id`
+   - `published_uptime_ms >= captured_uptime_ms`
+
+If those conditions fail, the row crossed a reboot boundary, so uptime subtraction is invalid and you should treat capture time as uncertain.
+
 `device_commands` should include at least:
 
 1. `id` (monotonic key used for ordering/patch).
@@ -232,7 +258,7 @@ Run the included SQL migration to create/align the `status` table used for devic
 
 Example metadata payloads now emitted by firmware:
 
-1. `boot`: `{"firmware":"<project_ver>","reason":"power_on"}`
+1. `boot`: `{"firmware":"<project_ver>","reason":"power_on","boot_id":123}`
 2. `online`: `{"ip":"192.168.x.x","rssi":-42}`
 3. `calibrated`: `{"sensors":["temp","humidity","pressure"]}`
 4. `heartbeat`: `{"status":"healthy|degraded"}` (emitted every 30s)
@@ -242,6 +268,143 @@ Status rows also include top-level runtime state fields:
 
 1. `sample_rate_ms` (current sampling interval in milliseconds)
 2. `blink_on` (current LED blink state)
+
+### Telemetry table lineage migration (recommended)
+
+Run the telemetry migration to keep everything in the `telemetry` table only (no extra table/view required):
+
+1. Open Supabase Dashboard -> SQL Editor.
+2. Paste and run:
+   - [`supabase/migrations/002_telemetry_backlog_fields.sql`](/C:/Users/Ahmad/Desktop/Tersano_ESP_Challenge/supabase/migrations/002_telemetry_backlog_fields.sql)
+3. Then run your telemetry-only SQL patch that adds:
+   - `captured_boot_id`
+   - `published_boot_id`
+   - `captured_unix_ms`
+4. Backfill legacy rows:
+   - `captured_uptime_ms = uptime_ms` where missing.
+
+### Reboot-safe query pattern (telemetry table only)
+
+Use this select pattern in dashboards/API queries to compute best-effort capture time directly from `public.telemetry`:
+
+```sql
+select
+  t.*,
+  case
+    when t.captured_unix_ms is not null
+      and t.captured_unix_ms >= 1704067200000
+    then to_timestamp(t.captured_unix_ms / 1000.0)
+    when t.captured_boot_id is not null
+      and t.published_boot_id is not null
+      and t.captured_boot_id = t.published_boot_id
+      and t.captured_uptime_ms is not null
+      and t.published_uptime_ms is not null
+      and t.published_uptime_ms >= t.captured_uptime_ms
+    then t.created_at - ((t.published_uptime_ms - t.captured_uptime_ms) * interval '1 millisecond')
+    else t.created_at
+  end as resolved_capture_at,
+  case
+    when t.captured_unix_ms is not null
+      and t.captured_unix_ms >= 1704067200000
+    then 'captured_unix_ms'
+    when t.captured_boot_id is not null
+      and t.published_boot_id is not null
+      and t.captured_boot_id = t.published_boot_id
+      and t.captured_uptime_ms is not null
+      and t.published_uptime_ms is not null
+      and t.published_uptime_ms >= t.captured_uptime_ms
+    then 'uptime_same_boot'
+    else 'created_at_fallback'
+  end as capture_time_source,
+  case
+    when t.captured_unix_ms is not null
+      and t.captured_unix_ms >= 1704067200000
+    then false
+    when t.captured_boot_id is not null
+      and t.published_boot_id is not null
+      and t.captured_boot_id = t.published_boot_id
+      and t.captured_uptime_ms is not null
+      and t.published_uptime_ms is not null
+      and t.published_uptime_ms >= t.captured_uptime_ms
+    then false
+    else true
+  end as capture_time_uncertain
+from public.telemetry t;
+```
+
+Interpretation:
+
+1. `capture_time_source='captured_unix_ms'`: best quality.
+2. `capture_time_source='uptime_same_boot'`: good quality, derived from uptime delta.
+3. `capture_time_source='created_at_fallback'`: uncertain capture timing; treat as publish-time proxy.
+
+### Why reboot-safe lineage works
+
+Without boot IDs, a reboot can produce negative uptime deltas:
+
+1. Example: `captured_uptime_ms=16,901,782`, `published_uptime_ms=73,872`.
+2. Naive subtraction gives `-16,827,910 ms`, which pushes computed capture time into the future.
+
+With boot IDs:
+
+1. Firmware stamps `captured_boot_id` at sample time.
+2. Firmware stamps `published_boot_id` at send time.
+3. If IDs differ, uptime subtraction is skipped, and query falls back to safe logic.
+
+### Supabase validation checklist
+
+After deploying firmware + SQL, verify in SQL Editor:
+
+```sql
+-- Confirm columns exist
+select column_name, data_type
+from information_schema.columns
+where table_schema='public' and table_name='telemetry'
+  and column_name in (
+    'captured_uptime_ms',
+    'published_uptime_ms',
+    'was_cached',
+    'captured_boot_id',
+    'published_boot_id',
+    'captured_unix_ms'
+  )
+order by column_name;
+```
+
+```sql
+-- Confirm new firmware rows are populating lineage fields
+select
+  device_id,
+  created_at,
+  captured_uptime_ms,
+  published_uptime_ms,
+  captured_boot_id,
+  published_boot_id,
+  captured_unix_ms,
+  was_cached
+from public.telemetry
+order by created_at desc
+limit 20;
+```
+
+```sql
+-- Count uncertain rows (usually reboot-crossing or no valid wall-clock)
+select
+  count(*) as uncertain_rows
+from public.telemetry t
+where not (
+  (t.captured_unix_ms is not null and t.captured_unix_ms >= 1704067200000)
+  or
+  (
+    t.captured_boot_id is not null
+    and t.published_boot_id is not null
+    and t.captured_boot_id = t.published_boot_id
+    and t.captured_uptime_ms is not null
+    and t.published_uptime_ms is not null
+    and t.published_uptime_ms >= t.captured_uptime_ms
+  )
+);
+```
 
 ## Build and Flash
 
