@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <ctime>
 
 #include "driver/i2c.h"
 #include "driver/gpio.h"
@@ -107,6 +108,10 @@ TelemetrySample SensorHal::read(uint32_t seq) {
   TelemetrySample sample = {};
   sample.seq = seq;
   sample.uptime_ms = static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
+  const std::time_t now_s = std::time(nullptr);
+  if (now_s >= 1704067200) {  // 2024-01-01T00:00:00Z sanity floor.
+    sample.captured_unix_ms = static_cast<uint64_t>(now_s) * 1000ULL;
+  }
   sample.battery_v = readBatteryVoltage();
 
   float t = NAN, h = NAN, p = NAN;

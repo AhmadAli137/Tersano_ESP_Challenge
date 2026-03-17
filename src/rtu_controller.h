@@ -62,6 +62,7 @@ class RtuController {
   NetworkHal net_;
   std::string device_id_;
   BacklogStore backlog_;
+  uint64_t boot_session_id_ = 0;
 
   QueueHandle_t sample_queue_ = nullptr;
   TaskHandle_t sample_task_handle_ = nullptr;

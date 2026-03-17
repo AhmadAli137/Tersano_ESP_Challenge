@@ -8,11 +8,13 @@
 
 #include "cJSON.h"
 #include "driver/gpio.h"
+#include "esp_err.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "nvs.h"
 
 namespace {
 constexpr const char* kTag = "RtuController";
@@ -35,6 +37,42 @@ constexpr uint32_t kLedBlinkOnWindowMs = 500;
 constexpr uint32_t kSamplingFastMs = 5000;       // 5 seconds
 constexpr uint32_t kSamplingDefaultMs = 300000;  // 5 minutes
 constexpr uint32_t kSamplingSlowMs = 1800000;    // 30 minutes
+constexpr const char* kNvsNamespace = "rtu";
+constexpr const char* kBootIdKey = "boot_id";
+
+uint64_t loadAndIncrementBootId() {
+  nvs_handle_t nvs = 0;
+  esp_err_t rc = nvs_open(kNvsNamespace, NVS_READWRITE, &nvs);
+  if (rc != ESP_OK) {
+    ESP_LOGW(kTag, "boot_id nvs_open failed (%s); defaulting to 0", esp_err_to_name(rc));
+    return 0;
+  }
+
+  uint64_t next_boot_id = 1;
+  uint64_t previous_boot_id = 0;
+  rc = nvs_get_u64(nvs, kBootIdKey, &previous_boot_id);
+  if (rc == ESP_OK) {
+    next_boot_id = previous_boot_id + 1;
+  } else if (rc != ESP_ERR_NVS_NOT_FOUND) {
+    ESP_LOGW(kTag, "boot_id nvs_get_u64 failed (%s); resetting counter", esp_err_to_name(rc));
+  }
+
+  rc = nvs_set_u64(nvs, kBootIdKey, next_boot_id);
+  if (rc != ESP_OK) {
+    ESP_LOGW(kTag, "boot_id nvs_set_u64 failed (%s)", esp_err_to_name(rc));
+    nvs_close(nvs);
+    return 0;
+  }
+  rc = nvs_commit(nvs);
+  if (rc != ESP_OK) {
+    ESP_LOGW(kTag, "boot_id nvs_commit failed (%s)", esp_err_to_name(rc));
+    nvs_close(nvs);
+    return 0;
+  }
+
+  nvs_close(nvs);
+  return next_boot_id;
+}
 
 bool readWifiLinkMeta(char* ip_out, size_t ip_out_len, int* rssi_out) {
   if (!ip_out || ip_out_len == 0 || !rssi_out) return false;
@@ -96,6 +134,34 @@ bool playBuzzerPreset(ActuatorHal& actuator, const char* preset) {
     return actuator.playTone(1047, 140) == ESP_OK;
   }
   return false;
+}
+
+bool applyTelemetryPublishFields(std::string& payload,
+                                 bool was_cached,
+                                 uint64_t published_uptime_ms,
+                                 uint64_t published_boot_id) {
+  if (payload.empty()) return false;
+  cJSON* root = cJSON_Parse(payload.c_str());
+  if (!root || !cJSON_IsObject(root)) {
+    if (root) cJSON_Delete(root);
+    return false;
+  }
+
+  cJSON_ReplaceItemInObject(root, "was_cached", cJSON_CreateBool(was_cached));
+  cJSON_ReplaceItemInObject(root, "published_uptime_ms",
+                            cJSON_CreateNumber(static_cast<double>(published_uptime_ms)));
+  cJSON_ReplaceItemInObject(root, "published_boot_id",
+                            cJSON_CreateNumber(static_cast<double>(published_boot_id)));
+
+  char* encoded = cJSON_PrintUnformatted(root);
+  if (!encoded) {
+    cJSON_Delete(root);
+    return false;
+  }
+  payload.assign(encoded);
+  cJSON_free(encoded);
+  cJSON_Delete(root);
+  return true;
 }
 
 std::string resolveDeviceId() {
@@ -161,6 +227,8 @@ void RtuController::begin() {
   sensor_.begin();
   net_.begin();
   net_.setCommandHandler([this](const std::string& body) { onCommand(body); });
+  boot_session_id_ = loadAndIncrementBootId();
+  ESP_LOGI(kTag, "Boot session id: %" PRIu64, boot_session_id_);
 
   if (!backlog_.begin(appcfg::BACKLOG_FILE, appcfg::MAX_BACKLOG_LINES)) {
     ESP_LOGE(kTag, "SPIFFS/backlog init failed");
@@ -201,11 +269,12 @@ void RtuController::begin() {
 #ifndef PROJECT_VER
 #define PROJECT_VER "unknown"
 #endif
-  char boot_meta[192];
+  char boot_meta[256];
   std::snprintf(boot_meta,
                 sizeof(boot_meta),
-                "{\"firmware\":\"%s\",\"reason\":\"power_on\"}",
-                PROJECT_VER);
+                "{\"firmware\":\"%s\",\"reason\":\"power_on\",\"boot_id\":%" PRIu64 "}",
+                PROJECT_VER,
+                boot_session_id_);
   publishStatusEvent("boot", boot_meta);
 
   TaskHandle_t sample_task = nullptr;
@@ -328,7 +397,9 @@ void RtuController::publishTask() {
       }
       continue;
     }
-    const std::string payload = sampleToJson(sample);
+    std::string payload = sampleToJson(sample);
+    const uint64_t publish_uptime_ms = static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
+    (void)applyTelemetryPublishFields(payload, false, publish_uptime_ms, boot_session_id_);
 
     if (net_.publishTelemetry(payload)) {
       markPublishResult(true);
@@ -439,6 +510,8 @@ void RtuController::connectivityTask() {
                    row.empty() ? "<empty>" : row.c_str());
           continue;
         }
+        const uint64_t replay_publish_uptime_ms = static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
+        (void)applyTelemetryPublishFields(row, true, replay_publish_uptime_ms, boot_session_id_);
         if (net_.publishTelemetry(row)) {
           markPublishResult(true);
           ++sync_records_in_window_;
@@ -695,6 +768,22 @@ std::string RtuController::sampleToJson(const TelemetrySample& sample) const {
   cJSON_AddStringToObject(root, "device_id", device_id_.c_str());
   cJSON_AddNumberToObject(root, "seq", static_cast<double>(sample.seq));
   cJSON_AddNumberToObject(root, "uptime_ms", static_cast<double>(sample.uptime_ms));
+  // Capture-side timing/value flags:
+  // - captured_uptime_ms: when sample was measured
+  // - captured_boot_id: boot session at capture time
+  // - captured_unix_ms: capture wall-clock timestamp when available
+  // - was_cached: flipped to true when replaying from backlog
+  // - published_uptime_ms/published_boot_id: populated at send/replay time
+  cJSON_AddNumberToObject(root, "captured_uptime_ms", static_cast<double>(sample.uptime_ms));
+  cJSON_AddNumberToObject(root, "captured_boot_id", static_cast<double>(boot_session_id_));
+  if (sample.captured_unix_ms > 0) {
+    cJSON_AddNumberToObject(root, "captured_unix_ms", static_cast<double>(sample.captured_unix_ms));
+  } else {
+    cJSON_AddNullToObject(root, "captured_unix_ms");
+  }
+  cJSON_AddBoolToObject(root, "was_cached", false);
+  cJSON_AddNullToObject(root, "published_uptime_ms");
+  cJSON_AddNullToObject(root, "published_boot_id");
   if (std::isnan(sample.temperature_c)) cJSON_AddNullToObject(root, "temperature_c");
   else cJSON_AddNumberToObject(root, "temperature_c", sample.temperature_c);
   if (std::isnan(sample.humidity_pct)) cJSON_AddNullToObject(root, "humidity_pct");
@@ -730,6 +819,9 @@ std::string RtuController::statusToJson(const char* event, const std::string& me
   if (!metadata || !cJSON_IsObject(metadata)) {
     if (metadata) cJSON_Delete(metadata);
     metadata = cJSON_CreateObject();
+  }
+  if (!cJSON_HasObjectItem(metadata, "boot_id")) {
+    cJSON_AddNumberToObject(metadata, "boot_id", static_cast<double>(boot_session_id_));
   }
   cJSON_AddItemToObject(root, "metadata", metadata);
 

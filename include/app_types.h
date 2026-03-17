@@ -12,6 +12,8 @@ struct TelemetrySample {
   uint32_t seq = 0;
   // Milliseconds since boot when this sample was taken.
   uint64_t uptime_ms = 0;
+  // Unix epoch time in milliseconds at capture; 0 means unavailable/not synchronized.
+  uint64_t captured_unix_ms = 0;
   // Environmental measurements; NAN means "not available".
   float temperature_c = NAN;
   float humidity_pct = NAN;
