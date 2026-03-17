@@ -121,6 +121,11 @@ Current pin/config defaults are in `include/app_config.h`:
 6. I2C SCL: `GPIO3`.
 7. Battery ADC input: `GPIO6` (`ADC1_CH5`).
 
+Reference board spec used for this project:
+
+1. ESP32-C5 Dual-Band WFi 6 Development Board
+2. 240MHz RISC-V Processor,Onboard ESP32-C5-WROOM-1 Series Module, Multi-Protocol RISC-V MCU, 16 MB Flash and 8 MB PS-RAM
+
 ## Project Layout
 
 1. `src/main.cpp`: bootstrap, retry logic, log-level tuning.
