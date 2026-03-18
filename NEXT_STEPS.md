@@ -1,5 +1,21 @@
 # Next Steps
 
+## Recently Completed
+
+1. Persisted runtime command settings to NVS:
+   - sampling interval (`sample_interval_ms`)
+   - LED blink enable state (`blink_on`)
+2. Added restore-on-boot behavior so both settings survive reboot.
+
+## Remaining Firmware Alignment
+
+1. Add challenge-compatible command alias support for:
+   - `{"action":"set_interval","value":30}` (seconds-based shape)
+2. Decide and lock target default sampling cadence for demo expectations.
+3. Optional bonus hardening:
+   - explicit TWDT task integration
+   - deep sleep between sample windows
+
 ## Deferred Security Hardening (Supabase)
 
 These items are intentionally deferred for now so development can continue.

@@ -89,6 +89,7 @@ Blink behavior:
 1. `toggle_led_blink` command can enable/disable LED blinking.
 2. Blinking applies to whatever status color is currently active.
 3. Blink cadence is 1 second period, 50% duty.
+4. Blink state is persisted in NVS and restored after reboot.
 
 ## Intermittent Publish Failures (Why They Happen)
 
@@ -167,6 +168,9 @@ Set in `include/app_config.h`:
 3. `MAX_SAMPLING_INTERVAL_MS = 1800000` (slow preset ceiling: 30 minutes).
 4. `COMMAND_POLL_INTERVAL_MS = 1000` (base cadence; adaptive idle backoff in `NetworkHal` may increase it temporarily).
 5. `MAX_BACKLOG_LINES = 2000`.
+6. Runtime settings persisted in NVS:
+   - `sample_interval_ms` (bounded to min/max on restore)
+   - `blink_on` (LED blink enable state)
 
 ### Supabase table names
 
@@ -247,6 +251,7 @@ Notes:
 1. `set_sampling_interval` drives the status LED color map for healthy/connected state.
 2. `play_buzzer` is a momentary tone pulse and then returns to off.
 3. `toggle_led_blink` accepts `enabled` (also `on`/`blink` aliases for compatibility).
+4. `set_sampling_interval` and `toggle_led_blink` are persisted to NVS and survive reboot.
 
 Command outcome events written to `status`:
 
@@ -482,7 +487,7 @@ This layout is 4MB-flash safe and also works on larger-flash boards.
 
 1. Bootloader loads app.
 2. `main.cpp` starts RTU bootstrap with retry.
-3. RTU initializes actuator, sensor, network, backlog.
+3. RTU initializes actuator, sensor, network, backlog, then restores persisted runtime config from NVS.
 4. RTU spawns `sampleTask`, `publishTask`, `connectivityTask`, and `commandTask`.
 5. System enters steady-state loop.
 

@@ -39,6 +39,8 @@ constexpr uint32_t kSamplingDefaultMs = 300000;  // 5 minutes
 constexpr uint32_t kSamplingSlowMs = 1800000;    // 30 minutes
 constexpr const char* kNvsNamespace = "rtu";
 constexpr const char* kBootIdKey = "boot_id";
+constexpr const char* kSamplingIntervalKey = "sample_ms";
+constexpr const char* kLedBlinkKey = "blink_on";
 constexpr const char* kDeviceIdFallbackPrefix = "rtu-esp32c5-";
 
 uint64_t loadAndIncrementBootId() {
@@ -73,6 +75,88 @@ uint64_t loadAndIncrementBootId() {
 
   nvs_close(nvs);
   return next_boot_id;
+}
+
+uint32_t clampSamplingInterval(uint32_t requested_ms) {
+  if (requested_ms < appcfg::MIN_SAMPLING_INTERVAL_MS) {
+    return appcfg::MIN_SAMPLING_INTERVAL_MS;
+  }
+  if (requested_ms > appcfg::MAX_SAMPLING_INTERVAL_MS) {
+    return appcfg::MAX_SAMPLING_INTERVAL_MS;
+  }
+  return requested_ms;
+}
+
+void loadRuntimeConfigFromNvs(volatile uint32_t* sample_interval_ms_out, bool* led_blink_out) {
+  if (sample_interval_ms_out) {
+    *sample_interval_ms_out = appcfg::DEFAULT_SAMPLING_INTERVAL_MS;
+  }
+  if (led_blink_out) {
+    *led_blink_out = false;
+  }
+
+  nvs_handle_t nvs = 0;
+  esp_err_t rc = nvs_open(kNvsNamespace, NVS_READONLY, &nvs);
+  if (rc != ESP_OK) {
+    ESP_LOGW(kTag, "runtime config nvs_open failed (%s); using defaults", esp_err_to_name(rc));
+    return;
+  }
+
+  if (sample_interval_ms_out) {
+    uint32_t stored_interval_ms = appcfg::DEFAULT_SAMPLING_INTERVAL_MS;
+    rc = nvs_get_u32(nvs, kSamplingIntervalKey, &stored_interval_ms);
+    if (rc == ESP_OK) {
+      *sample_interval_ms_out = clampSamplingInterval(stored_interval_ms);
+    } else if (rc != ESP_ERR_NVS_NOT_FOUND) {
+      ESP_LOGW(kTag, "runtime config read sample interval failed (%s)", esp_err_to_name(rc));
+    }
+  }
+
+  if (led_blink_out) {
+    uint8_t stored_blink = 0;
+    rc = nvs_get_u8(nvs, kLedBlinkKey, &stored_blink);
+    if (rc == ESP_OK) {
+      *led_blink_out = stored_blink != 0;
+    } else if (rc != ESP_ERR_NVS_NOT_FOUND) {
+      ESP_LOGW(kTag, "runtime config read blink state failed (%s)", esp_err_to_name(rc));
+    }
+  }
+
+  nvs_close(nvs);
+}
+
+bool saveRuntimeConfigToNvs(uint32_t sample_interval_ms, bool led_blink_enabled) {
+  nvs_handle_t nvs = 0;
+  esp_err_t rc = nvs_open(kNvsNamespace, NVS_READWRITE, &nvs);
+  if (rc != ESP_OK) {
+    ESP_LOGW(kTag, "runtime config nvs_open failed (%s)", esp_err_to_name(rc));
+    return false;
+  }
+
+  const uint32_t bounded_interval_ms = clampSamplingInterval(sample_interval_ms);
+  rc = nvs_set_u32(nvs, kSamplingIntervalKey, bounded_interval_ms);
+  if (rc != ESP_OK) {
+    ESP_LOGW(kTag, "runtime config nvs_set_u32 failed (%s)", esp_err_to_name(rc));
+    nvs_close(nvs);
+    return false;
+  }
+
+  rc = nvs_set_u8(nvs, kLedBlinkKey, led_blink_enabled ? 1 : 0);
+  if (rc != ESP_OK) {
+    ESP_LOGW(kTag, "runtime config nvs_set_u8 failed (%s)", esp_err_to_name(rc));
+    nvs_close(nvs);
+    return false;
+  }
+
+  rc = nvs_commit(nvs);
+  if (rc != ESP_OK) {
+    ESP_LOGW(kTag, "runtime config nvs_commit failed (%s)", esp_err_to_name(rc));
+    nvs_close(nvs);
+    return false;
+  }
+
+  nvs_close(nvs);
+  return true;
 }
 
 bool readWifiLinkMeta(char* ip_out, size_t ip_out_len, int* rssi_out) {
@@ -238,6 +322,11 @@ void RtuController::begin() {
   net_.setCommandHandler([this](const std::string& body) { onCommand(body); });
   boot_session_id_ = loadAndIncrementBootId();
   ESP_LOGI(kTag, "Boot session id: %" PRIu64, boot_session_id_);
+  loadRuntimeConfigFromNvs(&sample_interval_ms_, &led_blink_enabled_);
+  ESP_LOGI(kTag,
+           "Restored runtime config: sample_interval_ms=%" PRIu32 ", blink_on=%d",
+           sample_interval_ms_,
+           led_blink_enabled_ ? 1 : 0);
 
   if (!backlog_.begin(appcfg::BACKLOG_FILE, appcfg::MAX_BACKLOG_LINES)) {
     ESP_LOGE(kTag, "SPIFFS/backlog init failed");
@@ -625,6 +714,9 @@ void RtuController::onCommand(const std::string& json) {
         const uint32_t previous = sample_interval_ms_;
         sample_interval_ms_ = bounded;
         xSemaphoreGive(cfg_lock_);
+        if (!saveRuntimeConfigToNvs(sample_interval_ms_, led_blink_enabled_)) {
+          ESP_LOGW(kTag, "Failed to persist runtime config after set_sampling_interval");
+        }
         if (sample_task_handle_) {
           xTaskNotifyGive(sample_task_handle_);
         }
@@ -691,6 +783,9 @@ void RtuController::onCommand(const std::string& json) {
     if (cJSON_IsBool(enabled) || cJSON_IsNumber(enabled)) {
       const bool next = cJSON_IsBool(enabled) ? cJSON_IsTrue(enabled) : (enabled->valueint != 0);
       led_blink_enabled_ = next;
+      if (!saveRuntimeConfigToNvs(sample_interval_ms_, led_blink_enabled_)) {
+        ESP_LOGW(kTag, "Failed to persist runtime config after toggle_led_blink");
+      }
       ok = true;
       applied_type = "toggle_led_blink";
       reason = "applied";
@@ -710,6 +805,9 @@ void RtuController::onCommand(const std::string& json) {
         const uint32_t previous = sample_interval_ms_;
         sample_interval_ms_ = bounded;
         xSemaphoreGive(cfg_lock_);
+        if (!saveRuntimeConfigToNvs(sample_interval_ms_, led_blink_enabled_)) {
+          ESP_LOGW(kTag, "Failed to persist runtime config after legacy sampling interval command");
+        }
         if (sample_task_handle_) {
           xTaskNotifyGive(sample_task_handle_);
         }
